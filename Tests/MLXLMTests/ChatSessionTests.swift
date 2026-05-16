@@ -9,6 +9,137 @@ import XCTest
 
 @testable import MLXLMCommon
 
+private enum RecordingChatToken {
+    static let bos = 1
+    static let system = 2
+    static let tools = 3
+    static let assistantStart = 4
+    static let firstUser = 10
+    static let secondUser = 11
+    static let generated = 20
+    static let eos = 99
+
+    static func name(for id: Int) -> String {
+        switch id {
+        case bos: "<bos>"
+        case system: "<system>"
+        case tools: "<tools>"
+        case assistantStart: "<assistant>"
+        case firstUser: "user:SF"
+        case secondUser: "user:NYC"
+        case generated: "<generated>"
+        case eos: "<eos>"
+        default: "token\(id)"
+        }
+    }
+}
+
+private final class RecordingPromptStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _promptFragments = [[String]]()
+    private var _templateCallRoles = [[String]]()
+
+    func recordPromptFragment(_ tokens: [Int]) {
+        lock.lock()
+        _promptFragments.append(tokens.map(RecordingChatToken.name(for:)))
+        lock.unlock()
+    }
+
+    func recordTemplateCall(messages: [[String: any Sendable]]) {
+        let roles = messages.compactMap { $0["role"] as? String }
+        lock.lock()
+        _templateCallRoles.append(roles)
+        lock.unlock()
+    }
+
+    var promptFragments: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _promptFragments
+    }
+
+    var templateCallRoles: [[String]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _templateCallRoles
+    }
+}
+
+private struct RecordingChatTokenizer: Tokenizer {
+    let store: RecordingPromptStore
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        []
+    }
+
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        tokenIds.map(RecordingChatToken.name(for:)).joined(separator: " ")
+    }
+
+    func convertTokenToId(_ token: String) -> Int? {
+        token == eosToken ? RecordingChatToken.eos : nil
+    }
+
+    func convertIdToToken(_ id: Int) -> String? {
+        RecordingChatToken.name(for: id)
+    }
+
+    var bosToken: String? { "<bos>" }
+    var eosToken: String? { "<eos>" }
+    var unknownToken: String? { nil }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        store.recordTemplateCall(messages: messages)
+
+        var tokens = [RecordingChatToken.bos]
+        if messages.contains(where: { ($0["role"] as? String) == "system" }) {
+            tokens.append(RecordingChatToken.system)
+        }
+        if let tools, !tools.isEmpty {
+            tokens.append(RecordingChatToken.tools)
+        }
+        for message in messages {
+            guard (message["role"] as? String) == "user" else {
+                continue
+            }
+            let content = message["content"] as? String
+            tokens.append(
+                content?.contains("NYC") == true
+                    ? RecordingChatToken.secondUser
+                    : RecordingChatToken.firstUser)
+        }
+        tokens.append(RecordingChatToken.assistantStart)
+        store.recordPromptFragment(tokens)
+        return tokens
+    }
+}
+
+private final class RecordingLanguageModel: Module, LanguageModel {
+    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        let shape = inputs.shape
+        let batch = shape.count > 0 ? shape[0] : 1
+        let sequence = shape.count > 1 ? shape[1] : inputs.size
+        let vocabularySize = 128
+        var logits = Array(repeating: Float(-1_000), count: batch * sequence * vocabularySize)
+        for index in 0 ..< (batch * sequence) {
+            logits[index * vocabularySize + RecordingChatToken.generated] = 1_000
+        }
+        return MLXArray(logits).reshaped(batch, sequence, vocabularySize)
+    }
+
+    func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        [KVCacheSimple()]
+    }
+}
+
 /// See also ChatSessionIntegrationTests
 public class ChatSessionTests: XCTestCase {
 
@@ -42,6 +173,26 @@ public class ChatSessionTests: XCTestCase {
     private let generationParameters = GenerateParameters(maxTokens: 50)
 
     private let targetLength = 1
+
+    private func weatherTool() -> ToolSpec {
+        [
+            "type": "function",
+            "function": [
+                "name": "get_weather",
+                "description": "Get the current weather",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "location": [
+                            "type": "string",
+                            "description": "City name",
+                        ] as [String: any Sendable]
+                    ] as [String: any Sendable],
+                    "required": ["location"],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ] as ToolSpec
+    }
 
     func testChatSessionSync() async throws {
         let model = model()
@@ -98,6 +249,50 @@ public class ChatSessionTests: XCTestCase {
         // (avoids shutdown issues if this is the last/only test). because the
         // streaming task is not a synchronous shutdown
         await session.synchronize()
+    }
+
+    func testChatSessionDoesNotReemitToolsAfterCacheExists() async throws {
+        let pendingPromptCacheFix = true
+        try XCTSkipIf(
+            pendingPromptCacheFix,
+            "Pending fix: ChatSession re-emits BOS/tools on later turns even when a KV cache already exists.")
+
+        let store = RecordingPromptStore()
+        let tokenizer = RecordingChatTokenizer(store: store)
+        let configuration = ModelConfiguration(id: "recording-chat")
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let model = ModelContext(
+            configuration: configuration,
+            model: RecordingLanguageModel(),
+            processor: processor,
+            tokenizer: tokenizer
+        )
+        let session = ChatSession(
+            model,
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0),
+            tools: [weatherTool()]
+        )
+
+        _ = try await session.respond(to: "What is the weather in SF?")
+        _ = try await session.respond(to: "How about NYC?")
+
+        XCTAssertEqual(
+            store.templateCallRoles,
+            [["user"], ["user"]],
+            "The cached path should only prepare the new user turn on subsequent requests."
+        )
+        XCTAssertEqual(
+            store.promptFragments,
+            [
+                ["<bos>", "<tools>", "user:SF", "<assistant>"],
+                ["user:NYC", "<assistant>"],
+            ],
+            "Tool definitions are static prompt prefix content. Once a KV cache exists, the second turn should append only the new user turn instead of re-emitting BOS/tools."
+        )
     }
 
     func testChatSessionWithTools() async throws {
