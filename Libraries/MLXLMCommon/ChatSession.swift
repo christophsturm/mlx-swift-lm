@@ -65,7 +65,8 @@ public final class ChatSession {
 
     enum Cache {
         case empty
-        case kvcache([KVCache], draftKVCache: [KVCache]?)
+        case kvcache(
+            [KVCache], draftKVCache: [KVCache]?, promptAdditionsPrepared: Bool)
         case history([Chat.Message])
     }
 
@@ -225,7 +226,7 @@ public final class ChatSession {
     ///
     /// > Important: If the cache was built from a session that already included system
     /// > instructions, do not pass the same `instructions` here — they would be
-    /// > re-tokenized on each call to ``respond(to:role:images:videos:)`` without matching
+    /// > re-tokenized on the first call to ``respond(to:role:images:videos:)`` without matching
     /// > KV state, producing incoherent output.
     ///
     /// - Parameters:
@@ -253,7 +254,7 @@ public final class ChatSession {
     ) {
         self.model = model
         self.instructions = instructions
-        self.cache = .init(.kvcache(cache, draftKVCache: nil))
+        self.cache = .init(.kvcache(cache, draftKVCache: nil, promptAdditionsPrepared: false))
         self.processing = processing
         self.generateParameters = generateParameters
         self.tools = tools
@@ -270,7 +271,7 @@ public final class ChatSession {
     ///
     /// > Important: If the cache was built from a session that already included system
     /// > instructions, do not pass the same `instructions` here — they would be
-    /// > re-tokenized on each call to ``respond(to:role:images:videos:)`` without matching
+    /// > re-tokenized on the first call to ``respond(to:role:images:videos:)`` without matching
     /// > KV state, producing incoherent output.
     ///
     /// - Parameters:
@@ -298,7 +299,7 @@ public final class ChatSession {
     ) {
         self.model = ModelContainer(context: model)
         self.instructions = instructions
-        self.cache = .init(.kvcache(cache, draftKVCache: nil))
+        self.cache = .init(.kvcache(cache, draftKVCache: nil, promptAdditionsPrepared: false))
         self.processing = processing
         self.generateParameters = generateParameters
         self.tools = tools
@@ -428,9 +429,6 @@ public final class ChatSession {
                     let modelConfiguration = await model.configuration
 
                     var messages: [Chat.Message] = []
-                    if let instructions {
-                        messages.append(.system(instructions))
-                    }
 
                     // prepare the cache, if needed.  note:
                     // this is using the LanguageModel (not Sendable) outside
@@ -451,20 +449,36 @@ public final class ChatSession {
 
                     var kvCache: [KVCache]
                     var draftKVCache: [KVCache]?
+                    var promptAdditionsPrepared: Bool
                     switch cache {
                     case .empty:
+                        if let instructions {
+                            messages.append(.system(instructions))
+                        }
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache, draftKVCache: nil)
+                        cache = .kvcache(
+                            kvCache, draftKVCache: nil, promptAdditionsPrepared: false)
+                        promptAdditionsPrepared = false
 
-                    case .kvcache(let array, let storedDraftCache):
+                    case .kvcache(
+                        let array, let storedDraftCache, let storedPromptAdditionsPrepared):
                         kvCache = array
                         draftKVCache = storedDraftCache
+                        if !storedPromptAdditionsPrepared, let instructions {
+                            messages.append(.system(instructions))
+                        }
+                        promptAdditionsPrepared = storedPromptAdditionsPrepared
 
                     case .history(let history):
                         // the KVCache is represented by a chat history
+                        if let instructions {
+                            messages.append(.system(instructions))
+                        }
                         kvCache = model.newCache(parameters: generateParameters)
-                        cache = .kvcache(kvCache, draftKVCache: nil)
+                        cache = .kvcache(
+                            kvCache, draftKVCache: nil, promptAdditionsPrepared: false)
                         messages.append(contentsOf: history)
+                        promptAdditionsPrepared = false
                     }
 
                     // prepare the input
@@ -472,11 +486,19 @@ public final class ChatSession {
 
                     // loop can restart on tool calls
                     restart: while !messages.isEmpty {
+                        let shouldPreparePromptAdditions = !promptAdditionsPrepared
                         let userInput = UserInput(
                             chat: messages, processing: processing,
-                            tools: tools, additionalContext: additionalContext)
+                            tools: shouldPreparePromptAdditions ? tools : nil,
+                            additionalContext: additionalContext)
                         let input = try await processor.prepare(input: userInput)
                         messages.removeAll()
+                        if shouldPreparePromptAdditions {
+                            promptAdditionsPrepared = true
+                            cache = .kvcache(
+                                kvCache, draftKVCache: draftKVCache,
+                                promptAdditionsPrepared: true)
+                        }
 
                         // Select the token iterator based on speculative decoding configuration.
                         let (genStream, genTask): (AsyncStream<Generation>, Task<Void, Never>)
@@ -492,7 +514,9 @@ public final class ChatSession {
                             // exactly like the main model's KV cache.
                             if draftKVCache == nil {
                                 draftKVCache = draftModel.newCache(parameters: generateParameters)
-                                cache = .kvcache(kvCache, draftKVCache: draftKVCache)
+                                cache = .kvcache(
+                                    kvCache, draftKVCache: draftKVCache,
+                                    promptAdditionsPrepared: promptAdditionsPrepared)
                             }
                             let draftCache = draftKVCache!
 
@@ -616,7 +640,7 @@ public final class ChatSession {
     {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _):
+            case .kvcache(let cache, _, _):
                 return try await body(cache)
             default:
                 return try await body(nil)
@@ -635,7 +659,7 @@ public final class ChatSession {
     public func saveCache(to url: URL) async throws {
         try await cache.read { cache in
             switch cache {
-            case .kvcache(let cache, _):
+            case .kvcache(let cache, _, _):
                 try savePromptCache(url: url, cache: cache)
             default:
                 throw ChatSessionError.noCacheAvailable

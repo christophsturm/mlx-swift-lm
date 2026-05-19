@@ -16,7 +16,7 @@ private let promptTraceModels = IntegrationTestModels(
 
 struct ChatSessionPromptTraceTests {
 
-    @Test(.disabled("Pending non-hacky ChatSession prompt boundary fix"))
+    @Test
     func qwen36ChatSessionToolPromptBoundaries() async throws {
         let container = try await promptTraceModels.llmContainer(
             for: LLMRegistry.qwen3_6_27b_4bit)

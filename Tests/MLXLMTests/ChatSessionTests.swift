@@ -12,8 +12,10 @@ import XCTest
 private enum RecordingChatToken {
     static let bos = 1
     static let system = 2
-    static let tools = 3
+    static let weatherTool = 3
     static let assistantStart = 4
+    static let timeTool = 5
+    static let contextFlag = 6
     static let firstUser = 10
     static let secondUser = 11
     static let generated = 20
@@ -23,8 +25,10 @@ private enum RecordingChatToken {
         switch id {
         case bos: "<bos>"
         case system: "<system>"
-        case tools: "<tools>"
+        case weatherTool: "tool:weather"
         case assistantStart: "<assistant>"
+        case timeTool: "tool:time"
+        case contextFlag: "context:enable_thinking=false"
         case firstUser: "user:SF"
         case secondUser: "user:NYC"
         case generated: "<generated>"
@@ -36,38 +40,44 @@ private enum RecordingChatToken {
 
 private final class RecordingPromptStore: @unchecked Sendable {
     private let lock = NSLock()
-    private var _promptFragments = [[String]]()
-    private var _templateCallRoles = [[String]]()
+    private var _modelInputEvents = [String]()
 
-    func recordPromptFragment(_ tokens: [Int]) {
+    func recordModelInputEvent(kind: String, tokens: [Int]) {
+        let markers = tokens.compactMap(Self.markerName(for:))
         lock.lock()
-        _promptFragments.append(tokens.map(RecordingChatToken.name(for:)))
+        _modelInputEvents.append(contentsOf: markers.map { "\(kind):\($0)" })
         lock.unlock()
     }
 
-    func recordTemplateCall(messages: [[String: any Sendable]]) {
-        let roles = messages.compactMap { $0["role"] as? String }
-        lock.lock()
-        _templateCallRoles.append(roles)
-        lock.unlock()
-    }
-
-    var promptFragments: [[String]] {
+    var modelInputEvents: [String] {
         lock.lock()
         defer { lock.unlock() }
-        return _promptFragments
+        return _modelInputEvents
     }
 
-    var templateCallRoles: [[String]] {
-        lock.lock()
-        defer { lock.unlock() }
-        return _templateCallRoles
+    private static func markerName(for id: Int) -> String? {
+        switch id {
+        case RecordingChatToken.bos:
+            "bos"
+        case RecordingChatToken.system:
+            "system"
+        case RecordingChatToken.weatherTool:
+            "weatherTool"
+        case RecordingChatToken.timeTool:
+            "timeTool"
+        case RecordingChatToken.contextFlag:
+            "contextFlag"
+        case RecordingChatToken.firstUser:
+            "firstUser"
+        case RecordingChatToken.secondUser:
+            "secondUser"
+        default:
+            nil
+        }
     }
 }
 
 private struct RecordingChatTokenizer: Tokenizer {
-    let store: RecordingPromptStore
-
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
         []
     }
@@ -77,7 +87,14 @@ private struct RecordingChatTokenizer: Tokenizer {
     }
 
     func convertTokenToId(_ token: String) -> Int? {
-        token == eosToken ? RecordingChatToken.eos : nil
+        switch token {
+        case bosToken:
+            RecordingChatToken.bos
+        case eosToken:
+            RecordingChatToken.eos
+        default:
+            nil
+        }
     }
 
     func convertIdToToken(_ id: Int) -> String? {
@@ -93,14 +110,28 @@ private struct RecordingChatTokenizer: Tokenizer {
         tools: [[String: any Sendable]]?,
         additionalContext: [String: any Sendable]?
     ) throws -> [Int] {
-        store.recordTemplateCall(messages: messages)
-
-        var tokens = [RecordingChatToken.bos]
+        var tokens = [Int]()
         if messages.contains(where: { ($0["role"] as? String) == "system" }) {
+            tokens.append(RecordingChatToken.bos)
             tokens.append(RecordingChatToken.system)
         }
-        if let tools, !tools.isEmpty {
-            tokens.append(RecordingChatToken.tools)
+        for tool in tools ?? [] {
+            if !tokens.contains(RecordingChatToken.bos) {
+                tokens.append(RecordingChatToken.bos)
+            }
+            guard let function = tool["function"] as? [String: any Sendable],
+                let name = function["name"] as? String
+            else {
+                continue
+            }
+            if name.contains("time") {
+                tokens.append(RecordingChatToken.timeTool)
+            } else {
+                tokens.append(RecordingChatToken.weatherTool)
+            }
+        }
+        if (additionalContext?["enable_thinking"] as? Bool) == false {
+            tokens.append(RecordingChatToken.contextFlag)
         }
         for message in messages {
             guard (message["role"] as? String) == "user" else {
@@ -113,14 +144,33 @@ private struct RecordingChatTokenizer: Tokenizer {
                     : RecordingChatToken.firstUser)
         }
         tokens.append(RecordingChatToken.assistantStart)
-        store.recordPromptFragment(tokens)
         return tokens
     }
 }
 
 private final class RecordingLanguageModel: Module, LanguageModel {
+    let store: RecordingPromptStore
+
+    init(store: RecordingPromptStore) {
+        self.store = store
+        super.init()
+    }
+
     func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
-        .tokens(input.text)
+        store.recordModelInputEvent(
+            kind: "prepare",
+            tokens: input.text.tokens.asArray(Int.self))
+        return .tokens(input.text)
+    }
+
+    func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
+        -> LMOutput
+    {
+        store.recordModelInputEvent(
+            kind: "callText",
+            tokens: input.tokens.asArray(Int.self))
+        let logits = callAsFunction(input.tokens, cache: cache)
+        return .init(logits: logits)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -194,6 +244,21 @@ public class ChatSessionTests: XCTestCase {
         ] as ToolSpec
     }
 
+    private func timeTool() -> ToolSpec {
+        [
+            "type": "function",
+            "function": [
+                "name": "get_time",
+                "description": "Get the current time",
+                "parameters": [
+                    "type": "object",
+                    "properties": [:] as [String: any Sendable],
+                    "required": [] as [String],
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ] as ToolSpec
+    }
+
     func testChatSessionSync() async throws {
         let model = model()
         let session = ChatSession(model, generateParameters: generationParameters)
@@ -251,14 +316,9 @@ public class ChatSessionTests: XCTestCase {
         await session.synchronize()
     }
 
-    func testChatSessionDoesNotReemitToolsAfterCacheExists() async throws {
-        let pendingPromptCacheFix = true
-        try XCTSkipIf(
-            pendingPromptCacheFix,
-            "Pending fix: ChatSession re-emits BOS/tools on later turns even when a KV cache already exists.")
-
+    func testChatSessionDoesNotReemitStaticPromptMarkersAcrossTurns() async throws {
         let store = RecordingPromptStore()
-        let tokenizer = RecordingChatTokenizer(store: store)
+        let tokenizer = RecordingChatTokenizer()
         let configuration = ModelConfiguration(id: "recording-chat")
         let processor = TestInputProcessor(
             tokenizer: tokenizer,
@@ -267,31 +327,144 @@ public class ChatSessionTests: XCTestCase {
         )
         let model = ModelContext(
             configuration: configuration,
-            model: RecordingLanguageModel(),
+            model: RecordingLanguageModel(store: store),
             processor: processor,
             tokenizer: tokenizer
         )
         let session = ChatSession(
             model,
+            instructions: "You are a trace assistant.",
             generateParameters: GenerateParameters(maxTokens: 1, temperature: 0),
-            tools: [weatherTool()]
+            tools: [weatherTool(), timeTool()]
         )
 
         _ = try await session.respond(to: "What is the weather in SF?")
         _ = try await session.respond(to: "How about NYC?")
 
         XCTAssertEqual(
-            store.templateCallRoles,
-            [["user"], ["user"]],
-            "The cached path should only prepare the new user turn on subsequent requests."
-        )
-        XCTAssertEqual(
-            store.promptFragments,
+            store.modelInputEvents,
             [
-                ["<bos>", "<tools>", "user:SF", "<assistant>"],
-                ["user:NYC", "<assistant>"],
+                "prepare:bos",
+                "prepare:system",
+                "prepare:weatherTool",
+                "prepare:timeTool",
+                "prepare:firstUser",
+                "callText:bos",
+                "callText:system",
+                "callText:weatherTool",
+                "callText:timeTool",
+                "callText:firstUser",
+                "prepare:secondUser",
+                "callText:secondUser",
             ],
-            "Tool definitions are static prompt prefix content. Once a KV cache exists, the second turn should append only the new user turn instead of re-emitting BOS/tools."
+            "ChatSession should append only the newly rendered turn at the model boundary."
+        )
+    }
+
+    func testChatSessionKeepsAdditionalContextAcrossCachedTurns() async throws {
+        let store = RecordingPromptStore()
+        let tokenizer = RecordingChatTokenizer()
+        let configuration = ModelConfiguration(id: "recording-chat")
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let model = ModelContext(
+            configuration: configuration,
+            model: RecordingLanguageModel(store: store),
+            processor: processor,
+            tokenizer: tokenizer
+        )
+        let session = ChatSession(
+            model,
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0),
+            additionalContext: ["enable_thinking": false]
+        )
+
+        _ = try await session.respond(to: "What is the weather in SF?")
+        _ = try await session.respond(to: "How about NYC?")
+
+        XCTAssertEqual(
+            store.modelInputEvents,
+            [
+                "prepare:contextFlag",
+                "prepare:firstUser",
+                "callText:contextFlag",
+                "callText:firstUser",
+                "prepare:contextFlag",
+                "prepare:secondUser",
+                "callText:contextFlag",
+                "callText:secondUser",
+            ],
+            "ChatSession should pass template additionalContext for every rendered suffix."
+        )
+    }
+
+    func testRestoredCachePreparesFirstPromptAdditions() async throws {
+        let store = RecordingPromptStore()
+        let tokenizer = RecordingChatTokenizer()
+        let configuration = ModelConfiguration(id: "recording-chat")
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: configuration,
+            messageGenerator: DefaultMessageGenerator()
+        )
+        let model = ModelContext(
+            configuration: configuration,
+            model: RecordingLanguageModel(store: store),
+            processor: processor,
+            tokenizer: tokenizer
+        )
+        let container = ModelContainer(context: model)
+        let restoredTool = weatherTool()
+        let initial = ChatSession(
+            container,
+            generateParameters: GenerateParameters(maxTokens: 1, temperature: 0)
+        )
+
+        _ = try await initial.respond(to: "What is the weather in SF?")
+
+        try await initial.withCache { cache in
+            guard let cache else {
+                XCTFail("expected cache after initial response")
+                return
+            }
+
+            let restored = ChatSession(
+                container,
+                instructions: "You are a restored trace assistant.",
+                cache: cache.map { $0.copy() },
+                generateParameters: GenerateParameters(maxTokens: 1, temperature: 0),
+                additionalContext: ["enable_thinking": false],
+                tools: [restoredTool]
+            )
+
+            _ = try await restored.respond(to: "How about NYC?")
+            _ = try await restored.respond(to: "How about NYC?")
+        }
+
+        XCTAssertEqual(
+            store.modelInputEvents,
+            [
+                "prepare:firstUser",
+                "callText:firstUser",
+                "prepare:bos",
+                "prepare:system",
+                "prepare:weatherTool",
+                "prepare:contextFlag",
+                "prepare:secondUser",
+                "callText:bos",
+                "callText:system",
+                "callText:weatherTool",
+                "callText:contextFlag",
+                "callText:secondUser",
+                "prepare:contextFlag",
+                "prepare:secondUser",
+                "callText:contextFlag",
+                "callText:secondUser",
+            ],
+            "A restored KV cache should render this session's first prompt additions once."
         )
     }
 
