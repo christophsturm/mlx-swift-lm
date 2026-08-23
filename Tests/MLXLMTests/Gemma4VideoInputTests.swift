@@ -101,7 +101,7 @@ struct Gemma4VideoInputTests {
             return
         }
         eval(out.logits)
-        #expect(out.logits.shape == [1, tokens.count, 200])
+        #expect(out.logits.shape == [1, 1, 200])
     }
 
     /// `Gemma4Processor.processVideos` samples/preprocesses frames into a

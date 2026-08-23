@@ -255,11 +255,15 @@ private func gemma4PrepareTextOnly(
     let totalPositions = y.dim(1)
 
     let processed = try prefill.forEachChunk(total: totalPositions) { range in
-        _ = languageModel(y[0..., range], cache: convertedCache)
+        _ = languageModel.model(
+            y[0..., range],
+            cache: convertedCache.map { $0 as KVCache? }
+        )
         asyncEval(cache)
     }
     if processed > 0 { eval(cache) }
-    let result = languageModel(y[0..., processed...], cache: convertedCache)
+    let result = languageModel(
+        y[0..., processed...], cache: convertedCache, lastLogitsOnly: true)
     prefill.progress?(totalPositions, totalPositions)
     return .logits(result)
 }
@@ -1287,7 +1291,6 @@ final class Gemma4TextBackbone: Module {
         }
         let finalPerLayerInputs = projectPerLayerInputs(h0, perLayerInputs: processedPerLayerInputs)
 
-        let hasExplicitCache = cache != nil
         let localCache =
             cache ?? Array(repeating: nil as KVCache?, count: max(firstKVSharedLayerIdx, 1))
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode
@@ -1472,7 +1475,8 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         perLayerInputs: MLXArray? = nil,
         tokenTypeIds: MLXArray? = nil,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        emitDrafterState: Bool = false
+        emitDrafterState: Bool = false,
+        lastLogitsOnly: Bool = false
     ) -> LMOutput {
         let (hidden, sharedKV, sharedKVSources) = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
@@ -1480,11 +1484,13 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             tokenTypeIds: tokenTypeIds,
             emitDrafterState: emitDrafterState
         )
+        let projectedHidden =
+            lastLogitsOnly && hidden.dim(-2) > 1 ? hidden[0..., (-1)..., 0...] : hidden
         let logits: MLXArray
         if let lmHead {
-            logits = lmHead(hidden)
+            logits = lmHead(projectedHidden)
         } else {
-            logits = model.embedTokens.asLinear(hidden)
+            logits = model.embedTokens.asLinear(projectedHidden)
         }
         let softcappedLogits: MLXArray
         if let finalLogitSoftcapping, finalLogitSoftcapping > 0 {
@@ -2245,7 +2251,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
                     inputIds: input.text.tokens,
                     imageTokenId: config.imageTokenId,
                     videoTokenId: config.videoTokenId,
-                    audioTokenId: config.audioTokenId)
+                    audioTokenId: config.audioTokenId),
+                lastLogitsOnly: true
             )
             let total = inputsEmbeds.dim(1)
             prefill.progress?(total, total)
@@ -2745,7 +2752,8 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
             cache: cache.map { $0 },
             inputsEmbeds: inputsEmbeds,
             perLayerInputs: perLayerInputs,
-            tokenTypeIds: tokenTypeIds
+            tokenTypeIds: tokenTypeIds,
+            lastLogitsOnly: true
         )
         let total = inputsEmbeds.dim(1)
         prefill.progress?(total, total)
@@ -2903,14 +2911,15 @@ public struct Gemma4Processor: UserInputProcessor {
             ) { frame in
                 var userProcessing = processing ?? UserInput.Processing()
                 userProcessing.resize = targetSize
-                var image = MediaProcessing.apply(frame.frame, processing: userProcessing)
+                var image = MediaProcessing.apply(
+                    try frame.image.asCIImage(), processing: userProcessing)
                 image = MediaProcessing.inSRGBToneCurveSpace(image)
                 image = MediaProcessing.resampleBicubic(image, to: targetSize)
                 if config.doNormalize {
                     image = MediaProcessing.normalize(
                         image, mean: config.imageMeanTuple, std: config.imageStdTuple)
                 }
-                return VideoFrame(frame: image, timeStamp: frame.timeStamp)
+                return VideoFrame(image: .ciImage(image), timeStamp: frame.timeStamp)
             }
             allFrames.append(contentsOf: sequence.frames)
             frameCounts.append(sequence.frames.count)

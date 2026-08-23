@@ -174,8 +174,15 @@ public struct UserInput {
 
     /// Representation of an audio resource.
     public enum Audio {
+        /// Audio decoded from a file URL. Processing resolves the file's source format.
         case url(URL)
-        case array(MLXArray)
+
+        /// PCM samples already held in memory.
+        ///
+        /// - Parameters:
+        ///   - samples: Mono samples represented as an MLX array.
+        ///   - sampleRate: Source sample rate, or `nil` when the samples already use the processor's target rate.
+        case array(MLXArray, sampleRate: Double? = nil)
 
         // See also UserInput+Audio
     }

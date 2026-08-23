@@ -298,6 +298,6 @@ struct Gemma4UnifiedTests {
             Issue.record("Expected Gemma4Unified.prepare to return logits")
             return
         }
-        #expect(output.logits.shape == [1, 6, 32])
+        #expect(output.logits.shape == [1, 1, 32])
     }
 }
