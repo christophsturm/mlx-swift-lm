@@ -173,4 +173,36 @@ struct Gemma4ChunkedPrefillTests {
             drift.item(Float.self) < 5e-3,
             "1-D and [1, N] token inputs must produce identical logits.")
     }
+
+    @Test("TurboQuant compresses a shared global cache once on the first decode token")
+    func turboQuantSharedKVDecode() throws {
+        let model = try Self.makeTinyModel()
+        let tokens = Self.makePrompt(count: 21)
+        var cache = try model.newCache(parameters: nil)
+
+        let input = LMInput(tokens: MLXArray(tokens).expandedDimensions(axis: 0))
+        _ = try model.prepare(
+            input, cache: cache, state: nil, prefill: .init(stepSize: 512))
+        _ = try applyKVCacheConfiguration(
+            cache: &cache,
+            configuration: KVCacheConfiguration(
+                strategy: .turboQuant(.qualityFirst),
+                compatibility: .allowPartial))
+
+        let turboCaches = cache.compactMap { $0 as? TurboQuantKVCache }
+        try #require(turboCaches.count == 1)
+        let turboCache = try #require(turboCaches.first)
+        #expect(turboCache.offset == tokens.count)
+        #expect(!turboCache.isCompressed)
+
+        let logits = model(
+            MLXArray([17]).expandedDimensions(axis: 0), cache: cache)
+        eval(logits)
+
+        #expect(turboCache.isCompressed)
+        #expect(
+            turboCache.offset == tokens.count + 1,
+            "KV-sharing must not append the decode token a second time")
+        #expect(!MLX.isNaN(logits).any().item(Bool.self))
+    }
 }

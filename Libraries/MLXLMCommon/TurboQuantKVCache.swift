@@ -1168,13 +1168,6 @@ public class TurboQuantKVCache: BaseKVCache {
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
     ) -> MLXArray {
-        let headDim = newKeys.dim(-1)
-        let B = queries.dim(0)
-        let nQHeads = queries.dim(1)
-        let nKVHeads = newKeys.dim(1)
-        let L = queries.dim(2)
-        let nRepeats = nQHeads / nKVHeads
-
         // Transition: compress raw cache on first decode call
         if !isCompressed {
             compressRawCache()
@@ -1183,14 +1176,36 @@ public class TurboQuantKVCache: BaseKVCache {
         // Phase A: Encode new token
         encodeNewToken(keys: newKeys, values: newValues)
 
-        guard let valueMSECodec else {
+        return compressedAttention(queries: queries, scale: scale, mask: mask)
+    }
+
+    /// Runs compressed-domain attention against the current cache without appending K/V.
+    ///
+    /// KV-sharing architectures use this after the owning layer has appended the current
+    /// token. The cache must already be compressed and contain at least one token.
+    public func compressedAttention(
+        queries: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+    ) -> MLXArray {
+        precondition(
+            isCompressed && offset > 0,
+            "Cached-only TurboQuant attention requires a non-empty compressed cache")
+
+        guard let storedValues = valPackedMSE, let valueMSECodec else {
             return queries
         }
 
+        let headDim = queries.dim(-1)
+        let B = queries.dim(0)
+        let nQHeads = queries.dim(1)
+        let nKVHeads = storedValues.dim(1)
+        let L = queries.dim(2)
+        let nRepeats = nQHeads / nKVHeads
         let tokenCount = offset
 
         // Shared V slicing (used by all paths)
-        let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
+        let flatValPacked = storedValues[0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
         let flatValNorms = valNorms![0..., 0..., ..<tokenCount]
             .reshaped([B * nKVHeads, tokenCount])

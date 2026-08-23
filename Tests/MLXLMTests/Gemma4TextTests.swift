@@ -45,6 +45,33 @@ struct Gemma4TextTests {
         #expect(nextLogits.shape == [1, 1, 32])
     }
 
+    @Test("Gemma4Text compresses shared TurboQuant KV exactly once during decode")
+    func turboQuantKVCacheSupportsSharedFullAttention() throws {
+        let model = Gemma4TextModel(try Self.configuration(attentionKEqV: false))
+        eval(model)
+
+        var cache: [KVCache] = try model.newCache(parameters: nil)
+        let promptLogits = model(MLXArray([1, 2, 3]).reshaped([1, 3]), cache: cache)
+        eval(promptLogits)
+        _ = try applyKVCacheConfiguration(
+            cache: &cache,
+            configuration: KVCacheConfiguration(
+                strategy: .turboQuant(.qualityFirst),
+                compatibility: .allowPartial))
+
+        let turboCache = try #require(cache.first as? TurboQuantKVCache)
+        #expect(turboCache.offset == 3)
+        #expect(!turboCache.isCompressed)
+
+        let nextLogits = model(MLXArray([4]).reshaped([1, 1]), cache: cache)
+        eval(nextLogits)
+
+        #expect(nextLogits.shape == [1, 1, 32])
+        #expect(turboCache.isCompressed)
+        #expect(turboCache.offset == 4)
+        #expect(!MLX.isNaN(nextLogits).any().item(Bool.self))
+    }
+
     private static func configuration(attentionKEqV: Bool) throws -> Gemma4TextConfiguration {
         let json = """
             {

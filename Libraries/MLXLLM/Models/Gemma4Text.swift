@@ -311,7 +311,8 @@ private class Gemma4Attention: Module {
         queries = qNorm(queries)
 
         let activePositionOffset = positionOffset ?? cache?.ropeOffset
-        let kvState: Gemma4SharedKVState
+        var kvState: Gemma4SharedKVState?
+        var pendingTurboKV: (cache: TurboQuantKVCache, keys: MLXArray, values: MLXArray)?
 
         if let sharedKV {
             // KV-shared layers use pre-computed KV from an earlier layer.
@@ -340,7 +341,14 @@ private class Gemma4Attention: Module {
                 v = v.transposed(0, 2, 1, 3)
             }
 
-            if let quantizedCache = cache as? QuantizedKVCacheProtocol {
+            if let turboCache = cache as? TurboQuantKVCache {
+                if L > 1 && !turboCache.isCompressed {
+                    let (updatedK, updatedV) = turboCache.update(keys: k, values: v)
+                    kvState = .regular(keys: updatedK, values: updatedV)
+                } else {
+                    pendingTurboKV = (turboCache, k, v)
+                }
+            } else if let quantizedCache = cache as? QuantizedKVCacheProtocol {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
                     keys: k, values: v)
                 kvState = .quantized(
@@ -361,44 +369,71 @@ private class Gemma4Attention: Module {
         queries = queries.transposed(0, 2, 1, 3)
         queries = applyRotaryPosition(rope, to: queries, offset: activePositionOffset)
 
+        let keysSeqLen: Int
+        if let pendingTurboKV {
+            keysSeqLen = pendingTurboKV.cache.offset + L
+        } else if let kvState {
+            keysSeqLen = kvState.sequenceLength
+        } else {
+            fatalError("Gemma4 attention expected a KV state")
+        }
+
         // Adjust mask if cache size differs from mask size
         var adjustedMask = mask
         if case .array(let maskArray) = mask {
-            let keysSeqLen = kvState.sequenceLength
             if maskArray.dim(-1) != keysSeqLen {
                 adjustedMask = .array(maskArray[.ellipsis, 0 ..< keysSeqLen])
             }
         }
 
-        let attentionOutput: MLXArray =
-            switch kvState {
-            case .regular(let keys, let values):
-                MLXFast.scaledDotProductAttention(
-                    queries: queries,
-                    keys: keys,
-                    values: values,
-                    scale: scale,
-                    mask: adjustedMask ?? .none
-                )
-            case .quantized(let keys, let values, let groupSize, let bits, let mode):
-                quantizedScaledDotProductAttention(
-                    queries: queries,
-                    quantizedKeys: keys,
-                    quantizedValues: values,
-                    scale: scale,
-                    mask: adjustedMask ?? .none,
-                    groupSize: groupSize,
-                    bits: bits,
-                    mode: mode
-                )
+        let attentionOutput: MLXArray
+        let resolvedKVState: Gemma4SharedKVState
+        if let pendingTurboKV {
+            attentionOutput = pendingTurboKV.cache.compressedAttention(
+                queries: queries,
+                keys: pendingTurboKV.keys,
+                values: pendingTurboKV.values,
+                scale: scale,
+                mask: adjustedMask ?? .none)
+            resolvedKVState = .turboQuant(pendingTurboKV.cache)
+        } else {
+            guard let kvState else {
+                fatalError("Gemma4 attention expected a KV state")
             }
+            resolvedKVState = kvState
+            attentionOutput =
+                switch kvState {
+                case .regular(let keys, let values):
+                    MLXFast.scaledDotProductAttention(
+                        queries: queries,
+                        keys: keys,
+                        values: values,
+                        scale: scale,
+                        mask: adjustedMask ?? .none
+                    )
+                case .quantized(let keys, let values, let groupSize, let bits, let mode):
+                    quantizedScaledDotProductAttention(
+                        queries: queries,
+                        quantizedKeys: keys,
+                        quantizedValues: values,
+                        scale: scale,
+                        mask: adjustedMask ?? .none,
+                        groupSize: groupSize,
+                        bits: bits,
+                        mode: mode
+                    )
+                case .turboQuant(let cache):
+                    cache.compressedAttention(
+                        queries: queries, scale: scale, mask: adjustedMask ?? .none)
+                }
+        }
 
         let output =
             attentionOutput
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
-        return (oProj(output), kvState, activePositionOffset)
+        return (oProj(output), resolvedKVState, activePositionOffset)
     }
 }
 

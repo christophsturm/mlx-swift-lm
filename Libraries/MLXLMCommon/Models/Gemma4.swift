@@ -17,13 +17,18 @@ public enum Gemma4SharedKVState {
         bits: Int,
         mode: QuantizationMode
     )
+    /// A compressed cache that KV-sharing layers query without appending another token.
+    case turboQuant(TurboQuantKVCache)
 
+    /// Number of cached tokens available to the receiving attention layer.
     public var sequenceLength: Int {
         switch self {
         case .regular(let keys, _):
             keys.dim(2)
         case .quantized(let keys, _, _, _, _):
             keys.0.dim(-2)
+        case .turboQuant(let cache):
+            cache.offset
         }
     }
 }
