@@ -388,6 +388,56 @@ func testMTPWarmAppendCarriesTargetContinuationStateIntoPrepare() throws {
 }
 
 @Test
+func testSpeculativePromptCacheRestoresTargetAndDrafterTogether() throws {
+    let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 32))
+    let drafter = MockDrafter(requiresPromptPrefill: true)
+    let parameters = GenerateParameters(maxTokens: 4, temperature: 0)
+    let sessionState = try MTPSpeculativeSessionState(
+        mainModel: main,
+        drafter: drafter,
+        parameters: parameters)
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        sessionState: sessionState,
+        parameters: parameters,
+        blockSize: 3)
+    while iterator.next() != nil {}
+    iterator._finalizeGenerationForTesting()
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mtp-session-\(UUID().uuidString).safetensors")
+    defer { try? FileManager.default.removeItem(at: url) }
+
+    try saveSpeculativePromptCache(
+        url: url,
+        sessionState: sessionState,
+        metadata: ["caller": "retained"])
+    let restored = try loadSpeculativePromptCacheSnapshot(
+        url: url,
+        mainModel: main,
+        drafter: drafter,
+        parameters: parameters)
+
+    #expect(restored.metadata == ["caller": "retained"])
+    #expect(restored.sessionState.processedTokenCount == sessionState.processedTokenCount)
+    #expect(restored.sessionState.tokenHistory == sessionState.tokenHistory)
+    #expect(restored.sessionState.cache.count == sessionState.cache.count)
+    #expect(restored.sessionState.drafterState?.cache.count == sessionState.drafterState?.cache.count)
+    #expect(
+        restored.sessionState.drafterState?.nextPosition
+            == sessionState.drafterState?.nextPosition)
+
+    _ = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(4), 5])),
+        mainModel: main,
+        drafter: drafter,
+        sessionState: restored.sessionState,
+        parameters: parameters,
+        blockSize: 3)
+}
+
+@Test
 func testFinalSingleTokenBudgetKeepsStatefulDrafterAligned() throws {
     let prompt: [Int32] = [1, 2, 3]
     let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 16))

@@ -10,6 +10,9 @@ public struct AdaptiveSpeculativeBlockSizeController: Sendable {
 
     private var rounds: [(accepted: Int, drafted: Int)] = []
 
+    /// Completed acceptance rounds retained when a speculative session is checkpointed.
+    package var checkpointRounds: [(accepted: Int, drafted: Int)] { rounds }
+
     /// Creates a controller whose widths include the verifier's anchor token.
     public init(maximumBlockSize: Int, initialBlockSize: Int, minimumBlockSize: Int = 4) {
         precondition(maximumBlockSize >= 2)
