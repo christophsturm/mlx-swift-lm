@@ -44,6 +44,23 @@ struct TurboQuantCodebookTests {
         let v2 = cb2.asArray(Float.self)
         #expect(v1 == v2, "Codebook should be deterministic")
     }
+
+    @Test func concurrentLazyPopulationAndReadsStayDeterministic() async {
+        let results = await withTaskGroup(of: (Int, [Float]).self) { group in
+            for index in 0 ..< 64 {
+                group.addTask {
+                    let dim = index.isMultiple(of: 3) ? 128 : index.isMultiple(of: 2) ? 80 : 96
+                    return (dim, TurboQuantCodebook.codebook(dim: dim, bits: 4).asArray(Float.self))
+                }
+            }
+            return await group.reduce(into: [(Int, [Float])]()) { $0.append($1) }
+        }
+
+        for (dim, centroids) in results {
+            #expect(centroids.count == 16)
+            #expect(centroids == centroids.sorted(), "Dimension \(dim) codebook was corrupted")
+        }
+    }
 }
 
 // MARK: - Rotation Tests

@@ -44,6 +44,21 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// probability-ratio acceptance sampler is available.
     var requiresGreedySampling: Bool { get }
 
+    /// Target transformer layers whose post-layer residuals condition this drafter.
+    var targetLayerCaptureIDs: [Int] { get }
+
+    /// Whether each round consumes every newly verified target hidden row instead of one bonus row.
+    var consumesTargetHiddenHistory: Bool { get }
+
+    /// Initial verification width for acceptance-driven adaptation, or `nil` for a fixed width.
+    var adaptiveBlockSizeInitial: Int? { get }
+
+    /// Smallest useful adaptive verification width, including the target anchor.
+    var adaptiveBlockSizeMinimum: Int { get }
+
+    /// Rejects target/drafter pairs whose dimensions or cache semantics are incompatible.
+    func validateTarget(_ target: any LanguageModel) throws
+
     /// K-step drafting from a constant position.
     ///
     /// Returns the proposed tokens as a `[B, blockSize - 1]` MLXArray. The
@@ -89,6 +104,37 @@ extension MTPDrafterModel {
     public var requiresSharedTargetKV: Bool { true }
     public var requiresPromptPrefill: Bool { false }
     public var requiresGreedySampling: Bool { false }
+    public var targetLayerCaptureIDs: [Int] { [] }
+    public var consumesTargetHiddenHistory: Bool { false }
+    public var adaptiveBlockSizeInitial: Int? { nil }
+    public var adaptiveBlockSizeMinimum: Int { 4 }
+    public func validateTarget(_: any LanguageModel) throws {}
+}
+
+/// Target-side surface used by DFlash-family drafters without retaining target modules.
+public protocol DFlashTargetModel: LanguageModel {
+    /// Residual width emitted after each requested transformer layer.
+    var dflashHiddenSize: Int { get }
+
+    /// Number of transformer layers available for capture.
+    var dflashTargetLayerCount: Int { get }
+
+    /// Vocabulary shared by target embeddings, logits, and draft tokens.
+    var dflashVocabularySize: Int { get }
+
+    /// Embeds draft input tokens through the target's canonical token table.
+    func dflashTokenEmbeddings(_ tokens: MLXArray) -> MLXArray
+
+    /// Projects draft hidden states through the target's canonical LM head.
+    func dflashLogits(_ hiddenStates: MLXArray) -> MLXArray
+}
+
+/// Structural mismatch between a DFlash-family checkpoint and its target model.
+public enum DFlashTargetCompatibilityError: Error, Equatable, Sendable {
+    case unsupportedTarget(String)
+    case hiddenSize(drafter: Int, target: Int)
+    case layerCount(drafter: Int, target: Int)
+    case vocabularySize(drafter: Int, target: Int)
 }
 
 /// Target-side capability for rewinding an in-place speculative verify pass.
@@ -98,6 +144,39 @@ extension MTPDrafterModel {
 /// select an in-place path whose recurrent checkpoint is too shallow.
 public protocol SpeculativeCacheRewindModel {
     var maximumNativeTargetCacheRewind: Int { get }
+}
+
+/// Target capability for verifying speculative blocks with singleton-equivalent numerics.
+///
+/// Multi-token matrix multiplication can accumulate in a different order than decode-time
+/// one-token calls. Architectures that use exact token equality for acceptance implement this
+/// capability so a block proposal produces the same logits and recurrent state as sequential
+/// target decoding while retaining architecture-specific fused kernels.
+public protocol ExactSpeculativeVerificationModel: LanguageModel {
+    /// Evaluates a verification block with the target's exact speculative execution path.
+    ///
+    /// - Parameters:
+    ///   - input: Bonus and drafted tokens in target verification order.
+    ///   - cache: Target caches to advance tentatively for this round.
+    ///   - state: Continuation and MTP capture state required by the target.
+    /// - Returns: Logits and continuation state matching sequential one-token evaluation.
+    func verifySpeculativeBlock(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput
+}
+
+/// Target capability for exact greedy verification without exposing full logits.
+///
+/// The model owns fallback behavior because its cache has already advanced once verification
+/// starts. Implementations must therefore return exact greedy tokens even when their fused
+/// projection kernel is unavailable, rather than asking the iterator to run the model again.
+public protocol ExactSpeculativeGreedyVerificationModel:
+    ExactSpeculativeVerificationModel
+{
+    /// Verifies a proposal and returns the exact greedy token for every input position.
+    func verifySpeculativeBlockGreedy(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> FusedGreedyDecodeOutput
 }
 
 /// Per-stream state for MTP drafters that need their own transient storage.
@@ -156,6 +235,21 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
         sampler: any LogitSampler
     )
 
+    /// Advances retained drafter state across an uncached prompt suffix.
+    ///
+    /// `targetHidden` starts with all target rows not yet consumed by the
+    /// drafter, followed by the newly appended prompt rows. This preserves
+    /// the shifted token/target-hidden alignment without replaying history.
+    func appendDrafterState(
+        target: any LanguageModel,
+        appendedTokens: MLXArray,
+        targetHidden: MLXArray,
+        firstBonus: MLXArray,
+        positionDeltas: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler: any LogitSampler
+    )
+
     /// Stateful variant of ``MTPDrafterModel/draftBlock(target:lastToken:lastHidden:sharedKV:positionDeltas:queryOffset:blockSize:sampler:)``.
     func draftBlock(
         target: any LanguageModel,
@@ -181,12 +275,31 @@ public protocol StatefulMTPDrafterModel: MTPDrafterModel {
         state: inout MTPDrafterState,
         sampler: any LogitSampler
     )
+
+    /// Rewinds speculative state to the shifted position retained after early finalization.
+    ///
+    /// Drafters whose private cache advances only over previously committed context may keep the
+    /// default no-op. Shifted autoregressive drafters override this to discard unreturned tokens.
+    func rewindDrafterState(
+        toNextPosition nextPosition: Int,
+        state: inout MTPDrafterState
+    )
 }
 
 extension StatefulMTPDrafterModel {
     public func prepareDrafterState(
         target _: any LanguageModel,
         promptTokens _: MLXArray,
+        targetHidden _: MLXArray,
+        firstBonus _: MLXArray,
+        positionDeltas _: MLXArray?,
+        state _: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) {}
+
+    public func appendDrafterState(
+        target _: any LanguageModel,
+        appendedTokens _: MLXArray,
         targetHidden _: MLXArray,
         firstBonus _: MLXArray,
         positionDeltas _: MLXArray?,
@@ -209,6 +322,11 @@ extension StatefulMTPDrafterModel {
             trimPromptCache(state.cache, numTokens: rejected)
         }
     }
+
+    public func rewindDrafterState(
+        toNextPosition _: Int,
+        state _: inout MTPDrafterState
+    ) {}
 }
 
 /// Lightweight context for an MTP drafter — simpler than `ModelContext`
@@ -271,6 +389,11 @@ public final class MTPDrafterContainer: Sendable {
 /// unchanged as `lastHidden`.
 public let mtpLastHiddenStatesKey =
     LMOutput.Key<MLXArray>("mtp.lastHiddenStates")
+
+/// Optional target transformer layer indices whose post-layer residuals must
+/// be concatenated into ``mtpLastHiddenStatesKey`` for DFlash-style drafters.
+public let mtpTargetLayerCaptureIDsKey =
+    LMOutput.Key<[Int]>("mtp.targetLayerCaptureIDs")
 
 /// Target writes one `(keys, values)` tuple per `layer_type`
 /// (`"full_attention"`, `"sliding_attention"`) here, drawn from the last

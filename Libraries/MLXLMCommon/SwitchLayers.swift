@@ -126,6 +126,26 @@ public class SwitchGLU: Module {
 
         return MLX.squeezed(x, axis: -2)
     }
+
+    /// Evaluates a speculative token block with the same gathered-expert layout as singleton decode.
+    package func exactSpeculativeBlock(_ x: MLXArray, indices: MLXArray) -> MLXArray {
+        guard x.ndim == 3, x.dim(1) > 1 else {
+            return self(x, indices)
+        }
+
+        let batchSize = x.dim(0)
+        let tokenCount = x.dim(1)
+        let topK = indices.dim(-1)
+        let flatInput = x.reshaped(batchSize * tokenCount, x.dim(2))
+        let flatIndices = indices.reshaped(batchSize * tokenCount, topK)
+        let expertInput = MLX.expandedDimensions(flatInput, axes: [-2, -3])
+
+        let up = upProj(expertInput, flatIndices, sortedIndices: false)
+        let gate = gateProj(expertInput, flatIndices, sortedIndices: false)
+        let activated = activation(gate) * up
+        let output = downProj(activated, flatIndices, sortedIndices: false)
+        return output.squeezed(axis: -2).reshaped(batchSize, tokenCount, topK, -1)
+    }
 }
 
 // MARK: - FusedGateUpSwitchGLU

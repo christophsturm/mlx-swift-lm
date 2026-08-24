@@ -105,6 +105,13 @@ enum TurboQuantCodebook {
     private static let lazyDims: [Int] = [80, 96]
     private static let lazyBits: [Int] = [2, 3, 4]
 
+    /// Reads the mutable centroid table under the same lock used by lazy population.
+    private static func cachedCentroids(dim: Int, bits: Int) -> [Float]? {
+        centroidLock.withLock {
+            precomputed[dim]?[bits]
+        }
+    }
+
     /// Ensure centroids for a given dim are populated. Thread-safe, generates once.
     private static func ensureCentroidsPopulated(dim: Int) {
         centroidLock.lock()
@@ -133,13 +140,13 @@ enum TurboQuantCodebook {
     /// runtime generation for truly uncommon ones.
     ///
     static func codebook(dim: Int, bits: Int) -> MLXArray {
-        if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
+        if let centroids = cachedCentroids(dim: dim, bits: bits) {
             return MLXArray(centroids)
         }
         // Lazy populate for known model dims (Qwen3-4B dim=80, etc.)
         if lazyDims.contains(dim) {
             ensureCentroidsPopulated(dim: dim)
-            if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
+            if let centroids = cachedCentroids(dim: dim, bits: bits) {
                 return MLXArray(centroids)
             }
         }
@@ -150,11 +157,11 @@ enum TurboQuantCodebook {
     /// Codebook boundaries (midpoints between adjacent centroids).
     static func boundaries(dim: Int, bits: Int) -> MLXArray {
         let centroids: [Float]
-        if let dimTable = precomputed[dim], let cached = dimTable[bits] {
+        if let cached = cachedCentroids(dim: dim, bits: bits) {
             centroids = cached
         } else if lazyDims.contains(dim) {
             ensureCentroidsPopulated(dim: dim)
-            if let dimTable = precomputed[dim], let cached = dimTable[bits] {
+            if let cached = cachedCentroids(dim: dim, bits: bits) {
                 centroids = cached
             } else {
                 centroids = generateCentroids(dim: dim, bits: bits)

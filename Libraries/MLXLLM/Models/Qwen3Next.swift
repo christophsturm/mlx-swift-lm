@@ -136,6 +136,13 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         downProj(silu(gateProj(x)) * upProj(x))
     }
+
+    /// Expands SiLU into primitive operations so an enclosing compiled model
+    /// trace can inline the MLP without invoking MLXNN's compiled wrapper.
+    func forward(_ x: MLXArray) -> MLXArray {
+        let gate = gateProj(x)
+        return downProj(sigmoidMultiply(gate, gate) * upProj(x))
+    }
 }
 
 public final class Qwen3NextGatedDeltaNet: Module {

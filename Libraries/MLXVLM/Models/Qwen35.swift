@@ -190,6 +190,7 @@ public struct Qwen35Configuration: Codable, Sendable {
     public let textConfiguration: TextConfiguration
     public let visionConfiguration: VisionConfiguration
     public let modelType: String
+    public let blockSize: Int?
     private let _ignoreIndex: Int?
     public var ignoreIndex: Int { _ignoreIndex ?? -100 }
     private let _imageTokenId: Int?
@@ -213,6 +214,7 @@ public struct Qwen35Configuration: Codable, Sendable {
         case textConfiguration = "text_config"
         case visionConfiguration = "vision_config"
         case modelType = "model_type"
+        case blockSize = "block_size"
         case _ignoreIndex = "ignore_index"
         case _imageTokenId = "image_token_id"
         case _videoTokenId = "video_token_id"
@@ -428,6 +430,60 @@ enum Qwen35Language {
 
             return oProj(output * sigmoid(gate))
         }
+
+        /// Verifies a token block while advancing M-RoPE attention one decode step at a time.
+        func exactSpeculativeForward(
+            _ x: MLXArray,
+            cache: KVCache?,
+            positionIds: MLXArray?
+        ) -> MLXArray {
+            let batchSize = x.dim(0)
+            let tokenCount = x.dim(1)
+            let projections = exactSpeculativeLinears([qProj, kProj, vProj], x)
+            let queryProjection = projections[0]
+            let queryParts = queryProjection.reshaped(
+                batchSize, tokenCount, numAttentionHeads, -1
+            ).split(parts: 2, axis: -1)
+            let queries = qNorm(queryParts[0]).transposed(0, 2, 1, 3)
+            let gate = queryParts[1].reshaped(batchSize, tokenCount, -1)
+            let keys = kNorm(
+                projections[1].reshaped(batchSize, tokenCount, numKeyValueHeads, -1)
+            ).transposed(0, 2, 1, 3)
+            let values = projections[2].reshaped(
+                batchSize, tokenCount, numKeyValueHeads, -1
+            ).transposed(0, 2, 1, 3)
+
+            let localCache: KVCache = cache ?? KVCacheSimple()
+            let attentionRows = (0 ..< tokenCount).map { token in
+                let tokenPositions: MLXArray
+                if let positionIds {
+                    tokenPositions = positionIds[.ellipsis, token ..< (token + 1)]
+                } else {
+                    let base = MLXArray(Int32(localCache.offset)).reshaped(1, 1)
+                    tokenPositions = broadcast(
+                        base[.newAxis, 0..., 0...], to: [3, batchSize, 1])
+                }
+                let (cosValues, sinValues) = rotaryEmbedding(
+                    x: values[0..., 0..., token ..< (token + 1), 0...],
+                    positionIds: tokenPositions)
+                let (rotatedQueries, rotatedKeys) = Qwen35Language.applyMultimodalRotaryPosEmb(
+                    q: queries[0..., 0..., token ..< (token + 1), 0...],
+                    k: keys[0..., 0..., token ..< (token + 1), 0...],
+                    cos: cosValues,
+                    sin: sinValues)
+                return attentionWithCacheUpdate(
+                    queries: rotatedQueries,
+                    keys: rotatedKeys,
+                    values: values[0..., 0..., token ..< (token + 1), 0...],
+                    cache: localCache,
+                    scale: scale,
+                    mask: .none)
+            }
+            let attention = concatenated(attentionRows, axis: 2)
+            let merged = attention.transposed(0, 2, 1, 3).reshaped(
+                batchSize, tokenCount, -1)
+            return exactSpeculativeLinear(oProj, merged * sigmoid(gate))
+        }
     }
 
     final class MLP: Module, UnaryLayer {
@@ -444,6 +500,14 @@ enum Qwen35Language {
 
         func callAsFunction(_ x: MLXArray) -> MLXArray {
             downProj(silu(gateProj(x)) * upProj(x))
+        }
+
+        /// Applies dense MLP projections with singleton-equivalent block accumulation.
+        func exactSpeculativeForward(_ x: MLXArray) -> MLXArray {
+            let projections = exactSpeculativeLinears([gateProj, upProj], x)
+            let gate = projections[0]
+            let up = projections[1]
+            return exactSpeculativeLinear(downProj, silu(gate) * up)
         }
     }
 
@@ -515,15 +579,20 @@ enum Qwen35Language {
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
             cache: MambaCache? = nil,
-            checkpointAfter: Int? = nil
+            checkpointAfter: Int? = nil,
+            exactSpeculative: Bool = false
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
 
-            var mixedQKV = inProjQKV(inputs)
-            let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-            let b = inProjB(inputs)
-            let a = inProjA(inputs)
+            let projections =
+                exactSpeculative
+                ? exactSpeculativeLinears([inProjQKV, inProjZ, inProjB, inProjA], inputs)
+                : [inProjQKV(inputs), inProjZ(inputs), inProjB(inputs), inProjA(inputs)]
+            var mixedQKV = projections[0]
+            let z = projections[1].reshaped(B, S, numVHeads, headVDim)
+            let b = projections[2]
+            let a = projections[3]
 
             let convState: MLXArray
             if let cacheState = cache?[0] {
@@ -619,7 +688,9 @@ enum Qwen35Language {
             }
 
             let gated = norm(out, gate: z)
-            return outProj(gated.reshaped(B, S, -1))
+            let flattened = gated.reshaped(B, S, -1)
+            return exactSpeculative
+                ? exactSpeculativeLinear(outProj, flattened) : outProj(flattened)
         }
     }
 
@@ -672,6 +743,25 @@ enum Qwen35Language {
             sharedY = sigmoid(sharedExpertGate(x)) * sharedY
 
             return combined + sharedY
+        }
+
+        /// Runs router and selected experts with singleton-equivalent block projections.
+        func exactSpeculativeForward(_ x: MLXArray) -> MLXArray {
+            var gates = exactSpeculativeLinear(gate, x)
+            gates = MLX.softmax(gates, axis: -1, precise: true)
+
+            let kth = gates.dim(-1) - topK
+            let indices = MLX.argPartition(gates, kth: kth, axis: -1)[.ellipsis, kth...]
+            var scores = MLX.takeAlong(gates, indices, axis: -1)
+            if normTopkProb {
+                scores = scores / scores.sum(axis: -1, keepDims: true)
+            }
+
+            let experts = switchMLP.exactSpeculativeBlock(x, indices: indices)
+            let combined = weightedExpertSum(experts, scores)
+            var shared = sharedExpert.exactSpeculativeForward(x)
+            shared = sigmoid(exactSpeculativeLinear(sharedExpertGate, x)) * shared
+            return combined + shared
         }
     }
 
@@ -736,6 +826,38 @@ enum Qwen35Language {
             let h = x + r
             return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
         }
+
+        /// Runs one speculative block with exact projections and cache-update semantics.
+        func exactSpeculativeForward(
+            _ x: MLXArray,
+            ssmMask: MLXArray?,
+            cache: KVCache?,
+            positionIds: MLXArray?,
+            checkpointAfter: Int?
+        ) -> MLXArray {
+            let residual: MLXArray
+            if isLinear {
+                residual = linearAttn!(
+                    inputLayerNorm(x),
+                    mask: ssmMask,
+                    cache: cache as? MambaCache,
+                    checkpointAfter: checkpointAfter,
+                    exactSpeculative: true)
+            } else {
+                residual = selfAttn!.exactSpeculativeForward(
+                    inputLayerNorm(x), cache: cache, positionIds: positionIds)
+            }
+
+            let hidden = x + residual
+            let normalized = postAttentionLayerNorm(hidden)
+            let feedForward =
+                if let moe = mlp as? SparseMoeBlock {
+                    moe.exactSpeculativeForward(normalized)
+                } else {
+                    (mlp as! MLP).exactSpeculativeForward(normalized)
+                }
+            return hidden + feedForward
+        }
     }
 
     final class Model: Module {
@@ -766,7 +888,9 @@ enum Qwen35Language {
             cache: [KVCache?]? = nil,
             positionIds: MLXArray? = nil,
             applyFinalNorm: Bool = true,
-            checkpointAfter: Int? = nil
+            checkpointAfter: Int? = nil,
+            captureLayerIDs: Set<Int> = [],
+            capture: ((MLXArray) -> Void)? = nil
         ) -> MLXArray {
             var hiddenStates: MLXArray
             if let inputsEmbeds {
@@ -800,8 +924,41 @@ enum Qwen35Language {
                     positionIds: positionIds,
                     checkpointAfter: checkpointAfter
                 )
+                if captureLayerIDs.contains(index) {
+                    capture?(hiddenStates)
+                }
             }
 
+            return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+        }
+
+        /// Runs target verification as a block while retaining per-token M-RoPE updates.
+        func exactSpeculativeForward(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]?,
+            positionIds: MLXArray?,
+            applyFinalNorm: Bool,
+            checkpointAfter: Int?,
+            captureLayerIDs: Set<Int>,
+            capture: ((MLXArray) -> Void)?
+        ) -> MLXArray {
+            var hiddenStates = inputsEmbeds ?? embedTokens(inputs)
+            let caches = cache ?? Array(repeating: nil as KVCache?, count: layers.count)
+            let ssmMask = createSSMMask(
+                h: hiddenStates, cache: caches[ssmIdx] as? MambaCache)
+
+            for (index, layer) in layers.enumerated() {
+                hiddenStates = layer.exactSpeculativeForward(
+                    hiddenStates,
+                    ssmMask: layer.isLinear ? ssmMask : nil,
+                    cache: caches[index],
+                    positionIds: positionIds,
+                    checkpointAfter: checkpointAfter)
+                if captureLayerIDs.contains(index) {
+                    capture?(hiddenStates)
+                }
+            }
             return applyFinalNorm ? norm(hiddenStates) : hiddenStates
         }
     }
@@ -834,22 +991,21 @@ enum Qwen35Language {
             super.init()
         }
 
-        func callAsFunction(
-            _ inputs: MLXArray,
-            inputsEmbeds: MLXArray? = nil,
-            cache: [KVCache?]? = nil,
-            state: LMOutput.State?,
-            mask: MLXArray? = nil,
-            positionIds providedPositionIds: MLXArray? = nil,
-            pixelValues: MLXArray? = nil,
-            imageGridTHW: [THW]? = nil,
-            videoGridTHW: [THW]? = nil
-        ) -> LMOutput {
-            var state = state ?? .init()
-
-            // Ensure inputs is 2D [batch, seq]. Text-only callers (e.g.
-            // WiredMemoryUtils, TokenIterator) may pass 1D token arrays.
-            let inputs = inputs.ndim == 1 ? inputs.expandedDimensions(axis: 0) : inputs
+        /// Resolves the shared text shape, continuation state, and M-RoPE positions.
+        private func resolveInputsAndPositions(
+            _ providedInputs: MLXArray,
+            cache: [KVCache?]?,
+            state providedState: LMOutput.State?,
+            mask: MLXArray?,
+            positionIds providedPositionIds: MLXArray?,
+            pixelValues: MLXArray?,
+            imageGridTHW: [THW]?,
+            videoGridTHW: [THW]?
+        ) -> (inputs: MLXArray, state: LMOutput.State, positionIds: MLXArray?) {
+            var state = providedState ?? .init()
+            let inputs =
+                providedInputs.ndim == 1
+                ? providedInputs.expandedDimensions(axis: 0) : providedInputs
 
             if pixelValues != nil {
                 state[precomputedPositionIdsKey] = nil
@@ -896,7 +1052,6 @@ enum Qwen35Language {
                 } else {
                     let batchSize = inputs.dim(0)
                     let seqLength = inputs.dim(1)
-
                     var delta = MLXArray(cacheOffset).asType(.int32)
                     if let ropeDeltas {
                         delta = delta + ropeDeltas.asType(.int32)
@@ -904,7 +1059,6 @@ enum Qwen35Language {
 
                     var base = MLXArray(0 ..< seqLength).asType(.int32)
                     base = broadcast(base[.newAxis, 0...], to: [batchSize, seqLength])
-
                     if delta.ndim == 0 {
                         delta = broadcast(delta, to: [batchSize])
                     } else if delta.dim(0) < batchSize {
@@ -918,15 +1072,45 @@ enum Qwen35Language {
                         base[.newAxis, 0..., 0...], to: [3, batchSize, seqLength])
                 }
             }
+            return (inputs, state, positionIds)
+        }
+
+        func callAsFunction(
+            _ inputs: MLXArray,
+            inputsEmbeds: MLXArray? = nil,
+            cache: [KVCache?]? = nil,
+            state: LMOutput.State?,
+            mask: MLXArray? = nil,
+            positionIds providedPositionIds: MLXArray? = nil,
+            pixelValues: MLXArray? = nil,
+            imageGridTHW: [THW]? = nil,
+            videoGridTHW: [THW]? = nil
+        ) -> LMOutput {
+            let resolved = resolveInputsAndPositions(
+                inputs,
+                cache: cache,
+                state: state,
+                mask: mask,
+                positionIds: providedPositionIds,
+                pixelValues: pixelValues,
+                imageGridTHW: imageGridTHW,
+                videoGridTHW: videoGridTHW)
+            let inputs = resolved.inputs
+            var state = resolved.state
+            let positionIds = resolved.positionIds
 
             let emitDrafterState = state[mtpEmitFlagKey] ?? false
+            let captureLayerIDs = state[mtpTargetLayerCaptureIDsKey] ?? []
+            var capturedHiddenStates = [MLXArray]()
             let preNormHidden = model(
                 inputs,
                 inputsEmbeds: inputsEmbeds,
                 cache: cache,
                 positionIds: positionIds,
                 applyFinalNorm: !emitDrafterState,
-                checkpointAfter: state[mtpCacheCheckpointIndexKey]
+                checkpointAfter: state[mtpCacheCheckpointIndexKey],
+                captureLayerIDs: Set(captureLayerIDs),
+                capture: { capturedHiddenStates.append($0) }
             )
             let hiddenStates = emitDrafterState ? model.norm(preNormHidden) : preNormHidden
 
@@ -938,7 +1122,9 @@ enum Qwen35Language {
             }
 
             if emitDrafterState {
-                state[mtpLastHiddenStatesKey] = hiddenStates
+                state[mtpLastHiddenStatesKey] =
+                    capturedHiddenStates.isEmpty
+                    ? hiddenStates : concatenated(capturedHiddenStates, axis: -1)
                 state[mtpSharedKVStatesKey] = qwen35VLMSharedKVState(
                     cache: cache, fullAttentionIndex: model.faIdx)
                 state[mtpSharedKVOffsetsKey] = qwen35VLMSharedKVOffsets(
@@ -948,6 +1134,148 @@ enum Qwen35Language {
             }
 
             return LMOutput(logits: out, state: state)
+        }
+
+        /// Greedily decodes a quantized continuation while preserving its M-RoPE state.
+        func fusedGreedyDecode(
+            _ providedInputs: MLXArray,
+            cache: [KVCache?]?,
+            state providedState: LMOutput.State?,
+            tokenMask: MLXArray?
+        ) -> FusedGreedyDecodeOutput? {
+            guard let lmHead, let quantizedHead = lmHead as? QuantizedLinear,
+                canExactSpeculativeQuantizedArgMax(lmHead)
+            else {
+                return nil
+            }
+            let outputSize = quantizedHead.weight.dim(0)
+            let paddedTokenMask: MLXArray?
+            if let tokenMask {
+                guard (1 ... 2).contains(tokenMask.ndim), tokenMask.dtype == .int32 else {
+                    return nil
+                }
+                let padded = padExactSpeculativeTokenMask(tokenMask, outputSize: outputSize)
+                guard padded.dim(0) == providedInputs.dim(0) * providedInputs.dim(1),
+                    padded.dim(1) >= (outputSize + 31) / 32
+                else {
+                    return nil
+                }
+                paddedTokenMask = padded
+            } else {
+                paddedTokenMask = nil
+            }
+            let resolved = resolveInputsAndPositions(
+                providedInputs,
+                cache: cache,
+                state: providedState,
+                mask: nil,
+                positionIds: nil,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil)
+            guard !(resolved.state[mtpEmitFlagKey] ?? false) else { return nil }
+
+            let hiddenStates = model(
+                resolved.inputs,
+                cache: cache,
+                positionIds: resolved.positionIds)
+            let tokens: MLXArray
+            if let paddedTokenMask {
+                guard
+                    let maskedTokens = exactSpeculativeQuantizedArgMax(
+                        lmHead, hiddenStates, tokenMask: paddedTokenMask)
+                else {
+                    preconditionFailure("validated Qwen token mask became unsupported after decode")
+                }
+                tokens = maskedTokens
+            } else {
+                tokens =
+                    exactSpeculativeQuantizedArgMax(lmHead, hiddenStates)
+                    ?? argMax(lmHead(hiddenStates), axis: -1)
+            }
+            return FusedGreedyDecodeOutput(tokens: tokens, state: resolved.state)
+        }
+
+        /// Verifies a text continuation with exact projections and shared M-RoPE state handling.
+        func exactSpeculativeForward(
+            _ providedInputs: MLXArray,
+            cache: [KVCache?]?,
+            state providedState: LMOutput.State?
+        ) -> LMOutput {
+            let result = exactSpeculativeHiddenStates(
+                providedInputs, cache: cache, state: providedState)
+            let logits: MLXArray
+            if let lmHead {
+                logits = exactSpeculativeLinear(lmHead, result.hiddenStates)
+            } else {
+                logits = exactSpeculativeEmbeddingProjection(
+                    model.embedTokens, result.hiddenStates)
+            }
+            return LMOutput(logits: logits, state: result.state)
+        }
+
+        /// Verifies a continuation and greedily samples its quantized output projection.
+        func exactSpeculativeGreedyForward(
+            _ providedInputs: MLXArray,
+            cache: [KVCache?]?,
+            state providedState: LMOutput.State?
+        ) -> FusedGreedyDecodeOutput {
+            let result = exactSpeculativeHiddenStates(
+                providedInputs, cache: cache, state: providedState)
+            let tokens: MLXArray
+            if let lmHead,
+                let fusedTokens = exactSpeculativeQuantizedArgMax(lmHead, result.hiddenStates)
+            {
+                tokens = fusedTokens
+            } else if let lmHead {
+                tokens = argMax(exactSpeculativeLinear(lmHead, result.hiddenStates), axis: -1)
+            } else {
+                tokens = argMax(
+                    exactSpeculativeEmbeddingProjection(model.embedTokens, result.hiddenStates),
+                    axis: -1)
+            }
+            return FusedGreedyDecodeOutput(
+                tokens: tokens, state: result.state)
+        }
+
+        /// Advances exact Qwen VLM layers and assembles the shared M-RoPE continuation state.
+        private func exactSpeculativeHiddenStates(
+            _ providedInputs: MLXArray,
+            cache: [KVCache?]?,
+            state providedState: LMOutput.State?
+        ) -> (hiddenStates: MLXArray, state: LMOutput.State) {
+            let resolved = resolveInputsAndPositions(
+                providedInputs,
+                cache: cache,
+                state: providedState,
+                mask: nil,
+                positionIds: nil,
+                pixelValues: nil,
+                imageGridTHW: nil,
+                videoGridTHW: nil)
+            var state = resolved.state
+            let captureLayerIDs = state[mtpTargetLayerCaptureIDsKey] ?? []
+            var capturedHiddenStates = [MLXArray]()
+            let hidden = model.exactSpeculativeForward(
+                resolved.inputs,
+                cache: cache,
+                positionIds: resolved.positionIds,
+                applyFinalNorm: false,
+                checkpointAfter: state[mtpCacheCheckpointIndexKey],
+                captureLayerIDs: Set(captureLayerIDs),
+                capture: { capturedHiddenStates.append($0) })
+            let hiddenStates = model.norm(hidden)
+
+            state[mtpLastHiddenStatesKey] =
+                capturedHiddenStates.isEmpty
+                ? hiddenStates : concatenated(capturedHiddenStates, axis: -1)
+            state[mtpSharedKVStatesKey] = qwen35VLMSharedKVState(
+                cache: cache, fullAttentionIndex: model.faIdx)
+            state[mtpSharedKVOffsetsKey] = qwen35VLMSharedKVOffsets(
+                cache: cache, fullAttentionIndex: model.faIdx)
+            state[mtpSharedKVSourceIndicesKey] = ["full_attention": model.faIdx]
+            state[mtpPositionDeltasKey] = state[ropeDeltasKey]
+            return (hiddenStates, state)
         }
 
         func makeCache(capacity: KVCacheConfiguration.Capacity?) -> [KVCache] {
@@ -996,7 +1324,9 @@ private func qwen35VLMSharedKVOffsets(
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel {
+public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
+    ExactSpeculativeGreedyVerificationModel, FusedGreedyDecodeModel
+{
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") var languageModel: Qwen35Language.LanguageModel
 
@@ -1313,6 +1643,41 @@ public class Qwen35: Module, VLMModel {
         return result
     }
 
+    /// Verifies DSpark/MTP proposals through the production VLM continuation state.
+    public func verifySpeculativeBlock(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        precondition(
+            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            "Qwen35 cannot verify a warm prompt cache without \(ropeDeltasKey.id)")
+        return languageModel.exactSpeculativeForward(
+            input.tokens, cache: castCacheOptional(cache), state: state)
+    }
+
+    /// Verifies DSpark/MTP proposals without materializing quantized vocabulary logits.
+    public func verifySpeculativeBlockGreedy(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> FusedGreedyDecodeOutput {
+        precondition(
+            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            "Qwen35 cannot verify a warm prompt cache without \(ropeDeltasKey.id)")
+        return languageModel.exactSpeculativeGreedyForward(
+            input.tokens, cache: castCacheOptional(cache), state: state)
+    }
+
+    /// Greedily decodes a text continuation through Qwen's quantized output projection.
+    public func fusedGreedyDecode(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?,
+        tokenMask: MLXArray?
+    ) -> FusedGreedyDecodeOutput? {
+        precondition(
+            faCacheOffset(cache ?? []) == 0 || state?[ropeDeltasKey] != nil,
+            "Qwen35 cannot continue a warm prompt cache without \(ropeDeltasKey.id)")
+        return languageModel.fusedGreedyDecode(
+            input.tokens, cache: castCacheOptional(cache), state: state,
+            tokenMask: tokenMask)
+    }
+
     public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
         MLXArray]
     {
@@ -1390,7 +1755,24 @@ public class Qwen35: Module, VLMModel {
 }
 
 extension Qwen35: SpeculativeCacheRewindModel {
-    public var maximumNativeTargetCacheRewind: Int { 1 }
+    public var maximumNativeTargetCacheRewind: Int { .max }
+}
+
+extension Qwen35: DFlashTargetModel {
+    public var dflashHiddenSize: Int { languageModel.textConfig.hiddenSize }
+    public var dflashTargetLayerCount: Int { languageModel.textConfig.hiddenLayers }
+    public var dflashVocabularySize: Int { languageModel.textConfig.vocabularySize }
+
+    /// Uses the VLM language target's canonical token embeddings for draft inputs.
+    public func dflashTokenEmbeddings(_ tokens: MLXArray) -> MLXArray {
+        languageModel.model.embedTokens(tokens)
+    }
+
+    /// Uses the VLM language target's canonical output projection for draft logits.
+    public func dflashLogits(_ hiddenStates: MLXArray) -> MLXArray {
+        languageModel.lmHead?(hiddenStates)
+            ?? languageModel.model.embedTokens.asLinear(hiddenStates)
+    }
 }
 
 extension Array where Element == THW {

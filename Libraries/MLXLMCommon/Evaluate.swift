@@ -903,16 +903,39 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
-        let result = withPreparedCache(cache, lengths: previous.sequenceLengths) {
-            model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        let fusedResult: FusedGreedyDecodeOutput?
+        if processor == nil, sampler is ArgMaxSampler,
+            let fusedModel = model as? any FusedGreedyDecodeModel
+        {
+            fusedResult = withPreparedCache(cache, lengths: previous.sequenceLengths) {
+                fusedModel.fusedGreedyDecode(
+                    previous[text: .newAxis],
+                    cache: cache.isEmpty ? nil : cache,
+                    state: state,
+                    tokenMask: nil)
+            }
+        } else {
+            fusedResult = nil
         }
+
+        let token: MLXArray
+        if let fusedResult {
+            self.state = fusedResult.state
+            token = fusedResult.tokens[0..., -1]
+        } else {
+            let result = withPreparedCache(cache, lengths: previous.sequenceLengths) {
+                model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            }
+            self.state = result.state
+            token = convertToToken(logits: result.logits)
+        }
+
         cacheStorage.commitProcessedTokens(previous.cacheSequenceLength)
-        self.state = result.state
 
         // Apply dynamic cache quantization after each step
         kvCachePlan.apply(to: cacheStorage)
 
-        return convertToToken(logits: result.logits)
+        return token
     }
 
     mutating public func next() -> Int? {

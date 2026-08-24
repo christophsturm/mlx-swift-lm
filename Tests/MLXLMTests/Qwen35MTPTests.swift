@@ -1,6 +1,6 @@
 import Foundation
 import MLX
-import MLXLMCommon
+@_spi(Testing) import MLXLMCommon
 import Testing
 
 @testable import MLXLLM
@@ -294,6 +294,48 @@ struct Qwen35MTPMetalTests {
     }
 
     @Test
+    func testQwen35SeededDraftFillsTheRequestedBlock() throws {
+        let cfg = try JSONDecoder().decode(
+            MLXLLM.Qwen35TextConfiguration.self,
+            from: Data(qwen35TextConfigJSON(mtpLayers: 1).utf8))
+        let target = MLXLLM.Qwen35TextModel(cfg)
+        let drafter = MLXLLM.Qwen35MTPDraftModel(cfg)
+        let sampler = GenerateParameters(temperature: 0).sampler()
+        let prompt = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+
+        var targetState = LMOutput.State()
+        targetState[mtpEmitFlagKey] = true
+        let targetOutput = target(LMInput.Text(tokens: prompt), cache: nil, state: targetState)
+        let promptHidden = try #require(targetOutput.state?[mtpLastHiddenStatesKey])
+        var state = drafter.makeState(parameters: nil)
+        drafter.prepareDrafterState(
+            target: target, promptTokens: prompt, targetHidden: promptHidden,
+            firstBonus: MLXArray([Int32(4)]), positionDeltas: nil,
+            state: &state, sampler: sampler)
+        let seed = try #require(state.seedToken)
+
+        let proposal = drafter.draftBlock(
+            target: target, lastToken: MLXArray([Int32(4)]),
+            lastHidden: promptHidden[0..., (-1)..., 0...], sharedKV: [:],
+            positionDeltas: nil, queryOffset: 3, blockSize: 3,
+            state: &state, sampler: sampler)
+        eval(seed, proposal)
+
+        #expect(proposal.shape == [1, 2])
+        #expect(proposal[0..., ..<1].asArray(Int.self) == seed.asArray(Int.self))
+        #expect(state.proposalAppended == 1)
+        #expect(state.nextPosition == 4)
+        #expect(state.cache.allSatisfy { $0.offset == 4 })
+
+        drafter.rewindDrafterState(toNextPosition: 3, state: &state)
+        #expect(state.nextPosition == 3)
+        #expect(state.cache.allSatisfy { $0.offset == 3 })
+        #expect(state.seedToken == nil)
+        #expect(state.seedHidden == nil)
+        #expect(state.proposalAppended == 0)
+    }
+
+    @Test
     func testQwen35GDNCheckpointMatchesPrefixWithoutReplayingProjections() throws {
         let cfg = try JSONDecoder().decode(
             MLXLLM.Qwen35TextConfiguration.self,
@@ -371,6 +413,25 @@ struct Qwen35MTPMetalTests {
         #expect(allClose(restored[0], checkpointConv, rtol: 0, atol: 0).item(Bool.self))
         #expect(allClose(restored[1], checkpointState, rtol: 0, atol: 0).item(Bool.self))
     }
+
+    @Test
+    func testQwen35HybridCacheRewindRestoresMultiTokenRejectedTail() {
+        let attention = KVCacheSimple()
+        let keys = MLXArray.zeros([1, 1, 8, 2])
+        _ = attention.update(keys: keys, values: keys)
+
+        let recurrent = MambaCache()
+        let checkpointConv = MLXArray.ones([1, 1, 4])
+        let checkpointState = MLXArray.ones([1, 2, 2, 2])
+        recurrent.saveSpeculativeCheckpoint(
+            convState: checkpointConv, recurrentState: checkpointState, advancedBy: 1)
+
+        let rewound = rewindSpeculativePromptCache([attention, recurrent], numTokens: 4)
+
+        #expect(rewound == 4)
+        #expect(attention.offset == 4)
+        #expect(!recurrent.hasSpeculativeCheckpoint)
+    }
 }
 
 @Suite(.serialized)
@@ -400,7 +461,7 @@ struct Qwen35MTPRegistrationTests {
             configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),
             modelType: "qwen3_5_mtp")
         #expect(standalone is MLXLLM.Qwen35MTPDraftModel)
-        #expect(standalone.maximumBlockSize == 2)
+        #expect(standalone.maximumBlockSize == 3)
         #expect(standalone.requiresPromptPrefill)
         #expect(!standalone.requiresSharedTargetKV)
         #expect(standalone.requiresGreedySampling)

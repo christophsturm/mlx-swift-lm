@@ -191,6 +191,10 @@ public enum GuidedGenerationLoop {
         // the first iteration). Subsequent arrays are built in the overlap window.
         var mask = try constraint.computeMask()
         var maskArray = buildMaskArray(for: mask, vocabSize: vocabSize, logitDim: logitDim)
+        var fusedToken: MLXArray?
+        var canUseFusedGreedy =
+            closingBias == nil && whitespaceBias == nil
+            && model is any FusedGreedyDecodeModel
 
         while tokenCount < maxTokens {
             // Cooperative cancellation: exit promptly when the enclosing Task
@@ -275,11 +279,17 @@ public enum GuidedGenerationLoop {
                     activeBias = activeBias.map { $0 + wsBias } ?? wsBias
                 }
             }
-            let token = applyMaskAndSample(
-                logits: logits,
-                maskArray: maskArray,
-                closingBias: activeBias
-            )
+            let token: UInt32
+            if let pendingToken = fusedToken {
+                token = pendingToken.item(UInt32.self)
+                fusedToken = nil
+            } else {
+                token = applyMaskAndSample(
+                    logits: logits,
+                    maskArray: maskArray,
+                    closingBias: activeBias
+                )
+            }
             let tokenId = Int(token)
 
             // Track the sampled token for whitespace run detection.
@@ -380,6 +390,13 @@ public enum GuidedGenerationLoop {
 
                 if shouldStopAfterFF { break }
 
+                let maskPreparedForFused = canUseFusedGreedy
+                if maskPreparedForFused {
+                    mask = try constraint.computeMask()
+                    maskArray = buildMaskArray(
+                        for: mask, vocabSize: vocabSize, logitDim: logitDim)
+                }
+
                 // Process FF tokens one at a time to update KV cache.
                 // Batching (T_q > 1 with populated cache) triggers an MLX
                 // bug: scaledDotProductAttention in .causal mode creates a
@@ -389,59 +406,120 @@ public enum GuidedGenerationLoop {
                 // optimized Metal kernel and skip the mask entirely.
                 for (i, ffToken) in ffTokens.enumerated() {
                     let tokenInput = LMInput.Text(tokens: MLXArray([ffToken]))
-                    let result = model(
-                        tokenInput[text: .newAxis],
-                        cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
-                        state: modelState
-                    )
-                    cacheStorage.commitProcessedTokens(tokenInput.cacheSequenceLength)
-                    modelState = result.state
-                    // Only need logits from the last FF token
-                    if i == ffTokens.count - 1 {
-                        logits = result.logits
+                    let isLast = i == ffTokens.count - 1
+                    let fusedResult: FusedGreedyDecodeOutput? =
+                        if isLast, canUseFusedGreedy {
+                            fusedGreedyDecode(
+                                model: model,
+                                input: tokenInput[text: .newAxis],
+                                cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
+                                state: modelState,
+                                mask: mask)
+                        } else {
+                            nil
+                        }
+
+                    if let fusedResult {
+                        modelState = fusedResult.state
+                        fusedToken = fusedResult.tokens[0..., -1]
+                    } else {
+                        if isLast, canUseFusedGreedy {
+                            canUseFusedGreedy = false
+                        }
+                        let regularResult = model(
+                            tokenInput[text: .newAxis],
+                            cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
+                            state: modelState
+                        )
+                        modelState = regularResult.state
+                        if isLast {
+                            logits = regularResult.logits
+                        }
                     }
+                    cacheStorage.commitProcessedTokens(tokenInput.cacheSequenceLength)
                 }
 
                 // Quantize the KV cache after the forward pass(es), matching the
                 // unconstrained TokenIterator. No-op unless `kvBits` is set.
                 kvCachePlan.apply(to: cacheStorage)
 
-                // Kick off GPU computation asynchronously
-                asyncEval(logits)
+                if let fusedToken {
+                    asyncEval(fusedToken)
+                    eval(fusedToken)
+                } else {
+                    // Kick off GPU computation asynchronously
+                    asyncEval(logits)
 
-                // Overlap: compute the next mask AND build its sample array on the
-                // CPU while the GPU runs the forward pass.
-                mask = try constraint.computeMask()
-                maskArray = buildMaskArray(for: mask, vocabSize: vocabSize, logitDim: logitDim)
+                    // Overlap: compute the next mask AND build its sample array on the
+                    // CPU while the GPU runs the forward pass.
+                    if !maskPreparedForFused {
+                        mask = try constraint.computeMask()
+                        maskArray = buildMaskArray(
+                            for: mask, vocabSize: vocabSize, logitDim: logitDim)
+                    }
 
-                // Wait for GPU to finish (may already be done)
-                eval(logits)
+                    // Wait for GPU to finish (may already be done)
+                    eval(logits)
+                }
             } else {
                 // Normal single-token forward pass (lazy)
                 let nextInput = LMInput.Text(tokens: MLXArray([Int32(token)]))
-                let result = model(
-                    nextInput[text: .newAxis],
-                    cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
-                    state: modelState
-                )
+                let maskPreparedForFused = canUseFusedGreedy
+                if maskPreparedForFused {
+                    mask = try constraint.computeMask()
+                    maskArray = buildMaskArray(
+                        for: mask, vocabSize: vocabSize, logitDim: logitDim)
+                }
+                let fusedResult: FusedGreedyDecodeOutput? =
+                    if canUseFusedGreedy {
+                        fusedGreedyDecode(
+                            model: model,
+                            input: nextInput[text: .newAxis],
+                            cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
+                            state: modelState,
+                            mask: mask)
+                    } else {
+                        nil
+                    }
+                if let fusedResult {
+                    modelState = fusedResult.state
+                    fusedToken = fusedResult.tokens[0..., -1]
+                } else {
+                    if canUseFusedGreedy {
+                        canUseFusedGreedy = false
+                    }
+                    let regularResult = model(
+                        nextInput[text: .newAxis],
+                        cache: cacheStorage.cache.isEmpty ? nil : cacheStorage.cache,
+                        state: modelState
+                    )
+                    modelState = regularResult.state
+                    logits = regularResult.logits
+                }
                 cacheStorage.commitProcessedTokens(nextInput.cacheSequenceLength)
-                modelState = result.state
-                logits = result.logits
 
                 // Quantize the KV cache after the forward pass, matching the
                 // unconstrained TokenIterator. No-op unless `kvBits` is set.
                 kvCachePlan.apply(to: cacheStorage)
 
-                // Kick off GPU computation asynchronously
-                asyncEval(logits)
+                if let fusedToken {
+                    asyncEval(fusedToken)
+                    eval(fusedToken)
+                } else {
+                    // Kick off GPU computation asynchronously
+                    asyncEval(logits)
 
-                // Overlap: compute the next mask AND build its sample array on the
-                // CPU while the GPU runs the forward pass.
-                mask = try constraint.computeMask()
-                maskArray = buildMaskArray(for: mask, vocabSize: vocabSize, logitDim: logitDim)
+                    // Overlap: compute the next mask AND build its sample array on the
+                    // CPU while the GPU runs the forward pass.
+                    if !maskPreparedForFused {
+                        mask = try constraint.computeMask()
+                        maskArray = buildMaskArray(
+                            for: mask, vocabSize: vocabSize, logitDim: logitDim)
+                    }
 
-                // Wait for GPU to finish (may already be done)
-                eval(logits)
+                    // Wait for GPU to finish (may already be done)
+                    eval(logits)
+                }
             }
         }
 
@@ -502,6 +580,24 @@ public enum GuidedGenerationLoop {
             }
         }
         return stopTokenIDs
+    }
+
+    /// Routes a pure grammar mask through a model-owned fused greedy projection.
+    ///
+    /// The mask remains packed so quantized heads can reject disallowed vocabulary rows without
+    /// allocating a full additive logit mask. Returning `nil` preserves the model protocol's
+    /// no-mutation fallback contract.
+    static func fusedGreedyDecode(
+        model: any LanguageModel,
+        input: LMInput.Text,
+        cache: [KVCache]?,
+        state: LMOutput.State?,
+        mask: MaskResult
+    ) -> FusedGreedyDecodeOutput? {
+        guard let model = model as? any FusedGreedyDecodeModel else { return nil }
+        let tokenMask = mask.needsApply ? MLXArray(mask.mask) : nil
+        return model.fusedGreedyDecode(
+            input, cache: cache, state: state, tokenMask: tokenMask)
     }
 
     /// Apply a *prebuilt* grammar mask and optional bias to logits, then argmax.

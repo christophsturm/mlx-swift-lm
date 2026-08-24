@@ -78,12 +78,13 @@ public struct SpeculativeDecodingTelemetry: Sendable, Equatable {
         drafted: Int,
         accepted: Int,
         targetVerified: Int,
+        targetModelCalls: Int = 1,
         draftModelCalls: Int? = nil
     ) {
         roundCount += 1
         draftTokenCount += drafted
         acceptedDraftTokenCount += accepted
-        targetModelCallCount += 1
+        targetModelCallCount += targetModelCalls
         draftModelCallCount += draftModelCalls ?? drafted
         targetVerifiedTokenCount += targetVerified
     }

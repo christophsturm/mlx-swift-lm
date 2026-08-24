@@ -15,15 +15,18 @@ import MLXNN
 public struct Qwen35Configuration: Codable, Sendable {
     var modelType: String
     var textConfig: Qwen35TextConfiguration
+    var blockSize: Int?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case textConfig = "text_config"
+        case blockSize = "block_size"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.modelType = try container.decode(String.self, forKey: .modelType)
+        self.blockSize = try container.decodeIfPresent(Int.self, forKey: .blockSize)
 
         if let textConfig = try container.decodeIfPresent(
             Qwen35TextConfiguration.self, forKey: .textConfig)

@@ -1530,6 +1530,23 @@ public class MambaCache: ArraysCache {
         speculativeCheckpoint != nil
     }
 
+    /// Installs a recurrent checkpoint for cross-package runtime tests.
+    @_spi(Testing) public func _saveSpeculativeCheckpointForTesting(
+        convState: MLXArray,
+        recurrentState: MLXArray,
+        advancedBy tokenCount: Int
+    ) {
+        saveSpeculativeCheckpoint(
+            convState: convState,
+            recurrentState: recurrentState,
+            advancedBy: tokenCount)
+    }
+
+    /// Reports checkpoint ownership for cross-package runtime tests.
+    @_spi(Testing) public var _hasSpeculativeCheckpointForTesting: Bool {
+        hasSpeculativeCheckpoint
+    }
+
     @discardableResult
     package func restoreSpeculativeCheckpoint() -> Bool {
         guard let checkpoint = speculativeCheckpoint else { return false }
@@ -2305,14 +2322,15 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     return cache.first?.trim(numTokens) ?? 0
 }
 
-/// Rewind a one-token speculative tail in a hybrid attention/recurrent cache.
-/// Attention entries trim normally; Mamba entries restore the checkpoint the
-/// model captured after the round's committed bonus token.
+/// Rewinds a speculative suffix in a hybrid attention/recurrent cache.
+/// Attention entries trim every row after the retained checkpoint; Mamba
+/// entries restore that checkpoint. Callers replay any accepted prefix that
+/// followed the checkpoint before committing the model-wide timeline.
 @discardableResult
-package func rewindSpeculativePromptCache(
+@_spi(Testing) public func rewindSpeculativePromptCache(
     _ cache: [KVCache], numTokens: Int
 ) -> Int {
-    guard numTokens == 1,
+    guard numTokens > 0,
         cache.allSatisfy({ entry in
             if entry.isTrimmable {
                 return entry.offset >= numTokens

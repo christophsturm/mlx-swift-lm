@@ -18,6 +18,7 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var draftBlockCallCount = 0
     var draftedTokenValue: Int32
     let requiresGreedySampling: Bool
+    let requiresPromptPrefill: Bool
     /// Per-call record of what the iterator handed `draftBlock`: the
     /// sequence-axis span of each sharedKV entry, and the query offset.
     /// Lets tests assert the state the drafter conditions on, not just the
@@ -26,10 +27,16 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
     private(set) var receivedQueryOffsets: [Int] = []
     private(set) var receivedPositionDeltaValues: [Int?] = []
     private(set) var receivedCacheOffsets: [Int?] = []
+    private(set) var appendedPromptTokenCounts: [Int] = []
 
-    init(draftedTokenValue: Int32 = 7, requiresGreedySampling: Bool = false) {
+    init(
+        draftedTokenValue: Int32 = 7,
+        requiresGreedySampling: Bool = false,
+        requiresPromptPrefill: Bool = false
+    ) {
         self.draftedTokenValue = draftedTokenValue
         self.requiresGreedySampling = requiresGreedySampling
+        self.requiresPromptPrefill = requiresPromptPrefill
         super.init()
     }
 
@@ -82,11 +89,27 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
         let vals = Array(repeating: draftedTokenValue, count: (blockSize - 1) * batch)
         return MLXArray(vals, [batch, blockSize - 1])
     }
+
+    func appendDrafterState(
+        target _: any LanguageModel,
+        appendedTokens: MLXArray,
+        targetHidden _: MLXArray,
+        firstBonus _: MLXArray,
+        positionDeltas _: MLXArray?,
+        state: inout MTPDrafterState,
+        sampler _: any LogitSampler
+    ) {
+        appendedPromptTokenCounts.append(appendedTokens.dim(-1))
+        state.nextPosition += appendedTokens.dim(-1) + 1
+        (state.cache.first as? MutableOffsetKVCache)?.offset += appendedTokens.dim(-1) + 1
+    }
 }
 
 /// Minimal `LanguageModel` mock that emits MTP state on every call when
 /// `mtpEmitFlagKey` is true. Returns shaped logits and a trimmable KV cache.
-private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvider {
+private class MockMainModel: Module, LanguageModel, KVCacheDimensionProvider,
+    ExactSpeculativeVerificationModel
+{
     var kvHeads: [Int] { [1] }
     /// Sequence of token values returned in increasing position order. Length
     /// must cover all positions the iterator will sample across the run.
@@ -102,7 +125,9 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     var emittedPositionDelta: Int?
 
     private(set) var callCount: Int = 0
+    private(set) var exactVerificationCallCount: Int = 0
     private(set) var lastIncomingEmitFlag: Bool? = nil
+    private(set) var incomingPreparePreservedStateValues: [Int?] = []
     private(set) var incomingPreservedStateValues: [Int?] = []
     /// Sequence-axis span of each emitted sharedKV snapshot, in emit order.
     /// Tests assert this against the mock cache offset to pin the mock's
@@ -115,10 +140,11 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
     }
 
     func prepare(
-        _ input: LMInput, cache: [KVCache], state _: LMOutput.State?, prefill _: PrefillParameters
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill _: PrefillParameters
     )
         throws -> PrepareResult
     {
+        incomingPreparePreservedStateValues.append(state?[preservedStateKey])
         if let prepareLogitsStateValue {
             var state = LMOutput.State()
             state[preservedStateKey] = prepareLogitsStateValue
@@ -207,6 +233,13 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
         return LMOutput(logits: logits)
     }
 
+    func verifySpeculativeBlock(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        exactVerificationCallCount += 1
+        return callAsFunction(input, cache: cache, state: state)
+    }
+
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
         [CountingKVCache()]
     }
@@ -223,6 +256,33 @@ private final class MockMainModel: Module, LanguageModel, KVCacheDimensionProvid
         }
         perPositionIndex += positions
         return MLXArray(data, [1, positions, vocab])
+    }
+}
+
+/// Exact target mock that can return greedy verifier tokens without full logits.
+private final class MockGreedyMainModel: MockMainModel,
+    ExactSpeculativeGreedyVerificationModel, FusedGreedyDecodeModel
+{
+    private(set) var greedyVerificationCallCount = 0
+    private(set) var fusedGreedyDecodeCallCount = 0
+
+    func verifySpeculativeBlockGreedy(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> FusedGreedyDecodeOutput {
+        greedyVerificationCallCount += 1
+        let result = callAsFunction(input, cache: cache, state: state)
+        return FusedGreedyDecodeOutput(
+            tokens: argMax(result.logits, axis: -1), state: result.state)
+    }
+
+    func fusedGreedyDecode(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?,
+        tokenMask: MLXArray?
+    ) -> FusedGreedyDecodeOutput? {
+        fusedGreedyDecodeCallCount += 1
+        let result = callAsFunction(input, cache: cache, state: state)
+        return FusedGreedyDecodeOutput(
+            tokens: argMax(result.logits, axis: -1), state: result.state)
     }
 }
 
@@ -294,6 +354,58 @@ private final class NonTrimmableCountingKVCache: CountingKVCache {
         c.offset = offset
         return c
     }
+}
+
+@Test
+func testMTPWarmAppendCarriesTargetContinuationStateIntoPrepare() throws {
+    let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 32))
+    main.prepareLogitsStateValue = 91
+    let drafter = MockDrafter(requiresPromptPrefill: true)
+    let parameters = GenerateParameters(maxTokens: 4)
+    let sessionState = try MTPSpeculativeSessionState(
+        mainModel: main,
+        drafter: drafter,
+        parameters: parameters)
+    var first = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        sessionState: sessionState,
+        parameters: parameters,
+        blockSize: 3)
+
+    _ = first.next()
+    first._finalizeGenerationForTesting()
+    _ = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(4), 5])),
+        mainModel: main,
+        drafter: drafter,
+        sessionState: sessionState,
+        parameters: parameters,
+        blockSize: 3)
+
+    #expect(main.incomingPreparePreservedStateValues == [nil, 91])
+}
+
+@Test
+func testFinalSingleTokenBudgetKeepsStatefulDrafterAligned() throws {
+    let prompt: [Int32] = [1, 2, 3]
+    let main = MockMainModel(nextLogitTokens: Array(repeating: 7, count: 16))
+    let drafter = MockDrafter()
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray(prompt)),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 2, temperature: 0),
+        blockSize: 3)
+
+    #expect(iterator.next() == 7)
+    #expect(iterator.next() == 7)
+    iterator._finalizeGenerationForTesting()
+
+    #expect(drafter.appendedPromptTokenCounts == [0])
+    #expect(iterator.drafterState != nil)
+    #expect(iterator.mainCacheStorage.processedTokenCount == prompt.count + 2)
 }
 
 // MARK: - Smallest-unit-of-work smoke test
@@ -382,6 +494,70 @@ func testMTPSpeculateRoundSmokeWithSynthetics() throws {
     #expect(telemetry.emittedTokenCount == iter.tokenCount)
     // Verify the main model received emit=true on every call after prefill.
     #expect(main.lastIncomingEmitFlag == true)
+}
+
+@Test("Verification dispatches through a target's exact block capability")
+func exactVerificationCapabilityIsUsed() throws {
+    let main = MockMainModel(nextLogitTokens: [0, 0, 7, 7, 7, 9])
+    let drafter = MockDrafter(draftedTokenValue: 7)
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+        blockSize: 3)
+
+    _ = iterator.next()
+    _ = iterator.next()
+
+    #expect(main.exactVerificationCallCount == 1)
+}
+
+@Test("Greedy verification consumes target tokens without materializing iterator logits")
+func exactGreedyVerificationCapabilityIsUsed() throws {
+    let main = MockGreedyMainModel(nextLogitTokens: [0, 0, 7, 7, 7, 9])
+    let drafter = MockDrafter(draftedTokenValue: 7)
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        mainModel: main,
+        drafter: drafter,
+        parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+        blockSize: 3)
+
+    _ = iterator.next()
+    _ = iterator.next()
+
+    #expect(main.greedyVerificationCallCount == 1)
+    #expect(main.exactVerificationCallCount == 0)
+}
+
+@Test("Normal greedy decoding dispatches through a model's fused output capability")
+func fusedGreedyDecodeCapabilityIsUsed() throws {
+    let main = MockGreedyMainModel(nextLogitTokens: [0, 0, 7, 8])
+    var iterator = try TokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        model: main,
+        processor: nil,
+        sampler: ArgMaxSampler(),
+        maxTokens: 2)
+
+    #expect(main.fusedGreedyDecodeCallCount == 1)
+    #expect(iterator.next() == 7)
+    #expect(main.fusedGreedyDecodeCallCount == 2)
+}
+
+@Test("Normal greedy decoding preserves the full-logit path for processors")
+func fusedGreedyDecodeDefersToProcessor() throws {
+    let main = MockGreedyMainModel(nextLogitTokens: [0, 0, 7])
+    _ = try TokenIterator(
+        input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+        model: main,
+        processor: EmissionLog(),
+        sampler: ArgMaxSampler(),
+        maxTokens: 1)
+
+    #expect(main.fusedGreedyDecodeCallCount == 0)
+    #expect(main.callCount == 1)
 }
 
 @Test
@@ -586,7 +762,7 @@ func testMTPVerifyLoopMutatesClassProcessorForEmittedTokensOnly() throws {
         0, 0, 5,  // prefill follow-up picks bonus 5 (positions 0/1 unused, < vocab=20)
         5, 9, 1, 2,  // verify positions: only position 0 matches draft
     ]
-    let main = MockMainModel(nextLogitTokens: mainLogitTokens)
+    let main = MockGreedyMainModel(nextLogitTokens: mainLogitTokens)
     let drafter = MockDrafter(draftedTokenValue: 5)
     let input = LMInput(tokens: MLXArray([Int32(1), 2, 3]))
 
@@ -619,6 +795,8 @@ func testMTPVerifyLoopMutatesClassProcessorForEmittedTokensOnly() throws {
     #expect(t2 == 9, "correction at the first rejected position")
     #expect(iter.proposedCount == 3, "numDraft=3 verify samples expected")
     #expect(iter.acceptedCount == 1, "only draft[0] matched")
+    #expect(main.greedyVerificationCallCount == 0)
+    #expect(main.exactVerificationCallCount == 1)
 
     #expect(iter._processorForTesting as? EmissionLog === emissionLog)
     #expect(
@@ -939,7 +1117,9 @@ func testTrimSharedKVStateNoOpOnNilStateAndAbsentKey() {
 /// It writes real K/V through whatever caches it is handed and emits `sharedKV` from what those
 /// caches returned, clamped per layer type exactly as the Gemma 4 emit hook does. So the cache
 /// machinery under test is exercised rather than simulated.
-private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDimensionProvider {
+private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDimensionProvider,
+    SpeculativeCacheRewindModel
+{
     static let vocabularySize = 32
 
     /// Which of `prepare`'s two shapes this model returns, and whether it emits drafter state
@@ -964,6 +1144,9 @@ private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDim
     /// from -- a snapshot the consumer cannot place against the cache.
     let omitSharedKVSources: Bool
     let prefillStyle: PrefillStyle
+    let includesRecurrentCache: Bool
+
+    var maximumNativeTargetCacheRewind: Int { includesRecurrentCache ? .max : 0 }
 
     private(set) var emittedSharedKVSpans: [[String: Int]] = []
     private(set) var verifyChunkLengths: [Int] = []
@@ -972,7 +1155,7 @@ private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDim
     init(
         script: [Int32], slidingWindow: Int, wideSlidingWindow: Int? = nil,
         omitDrafterState: Bool = false, omitSharedKVSources: Bool = false,
-        prefillStyle: PrefillStyle = .tokens
+        prefillStyle: PrefillStyle = .tokens, includesRecurrentCache: Bool = false
     ) {
         self.script = script
         self.slidingWindow = slidingWindow
@@ -980,6 +1163,7 @@ private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDim
         self.omitDrafterState = omitDrafterState
         self.omitSharedKVSources = omitSharedKVSources
         self.prefillStyle = prefillStyle
+        self.includesRecurrentCache = includesRecurrentCache
         super.init()
     }
 
@@ -990,6 +1174,9 @@ private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDim
         var cache: [KVCache] = [KVCacheSimple(), RotatingKVCache(maxSize: slidingWindow, keep: 0)]
         if let wideSlidingWindow {
             cache.append(RotatingKVCache(maxSize: wideSlidingWindow, keep: 0))
+        }
+        if includesRecurrentCache {
+            cache.append(MambaCache())
         }
         return cache
     }
@@ -1026,7 +1213,25 @@ private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDim
         if positions > 1 { verifyChunkLengths.append(positions) }
 
         let (keys, values) = Self.positionedKV(base ..< (base + positions))
-        let presented = cache.map { $0.update(keys: keys, values: values) }
+        var presented = [(MLXArray, MLXArray)]()
+        for entry in cache {
+            if let recurrent = entry as? MambaCache {
+                if let checkpointAfter = state?[mtpCacheCheckpointIndexKey],
+                    checkpointAfter > 0, checkpointAfter < positions
+                {
+                    let checkpointValue = MLXArray(Int32(base + checkpointAfter))
+                    recurrent._saveSpeculativeCheckpointForTesting(
+                        convState: checkpointValue,
+                        recurrentState: checkpointValue,
+                        advancedBy: checkpointAfter)
+                }
+                let currentValue = MLXArray(Int32(base + positions))
+                recurrent[0] = currentValue
+                recurrent[1] = currentValue
+            } else {
+                presented.append(entry.update(keys: keys, values: values))
+            }
+        }
 
         guard !omitDrafterState, state?[mtpEmitFlagKey] ?? false else {
             return LMOutput(logits: logits)
@@ -1067,6 +1272,39 @@ private final class PositionScriptedMainModel: Module, LanguageModel, KVCacheDim
         return (keys, keys * -1)
     }
 
+}
+
+/// A partial acceptance in a wide hybrid verify block must retain the accepted recurrent state,
+/// not restore every GDN layer only to the always-committed anchor.
+@Test
+func testHybridMixedAcceptanceReplaysAcceptedPrefixAfterRewind() throws {
+    let prompt: [Int32] = [1, 2, 3]
+    let model = PositionScriptedMainModel(
+        script: [0, 0, 7, 7, 9, 10], slidingWindow: 32,
+        includesRecurrentCache: true)
+    let drafter = MockDrafter(draftedTokenValue: 7)
+
+    var iterator = try MTPSpeculativeTokenIterator(
+        input: LMInput(tokens: MLXArray(prompt)),
+        mainModel: model,
+        drafter: drafter,
+        mainCache: model.newCache(parameters: nil),
+        parameters: GenerateParameters(maxTokens: 4, temperature: 0),
+        blockSize: 3)
+
+    #expect(iterator.next() == 7)
+    #expect(iterator.next() == 7)
+    #expect(iterator.acceptedCount == 1)
+    #expect(iterator.proposedCount == 2)
+    #expect(iterator.mainCacheStorage.processedTokenCount == 5)
+
+    let recurrent = try #require(iterator.mainCache.last as? MambaCache)
+    let recurrentState = try #require(recurrent[1])
+    #expect(recurrentState.item(Int.self) == 5)
+
+    let telemetry = try #require(iterator.speculativeDecodingTelemetry)
+    #expect(telemetry.targetModelCallCount == 2)
+    #expect(telemetry.targetVerifiedTokenCount == 4)
 }
 
 /// A script that mixes the drafted token with others, so rounds land on a spread of acceptance
@@ -1426,8 +1664,8 @@ func testReconcileSharedKVStateAcceptsAnAbsentSnapshot() throws {
 // through a round's accepted prefix, which is where the old rewind silently gave up past a
 // sliding window.
 //
-// The `- 1` is not slack: the last verifier sample is never cached in its own round. It is the
-// input to the next one.
+// Finalization evaluates the last verifier sample when needed, so a retained append-only session
+// always ends exactly after the tokens delivered to its consumer.
 
 @Test
 func testEveryRoundLeavesTheLeavesInStepWithTheTimeline() throws {
@@ -1453,7 +1691,7 @@ func testEveryRoundLeavesTheLeavesInStepWithTheTimeline() throws {
 
     #expect(iter.passthroughReason == nil)
     #expect(emitted == window * 6)
-    #expect(iter.mainCacheStorage.processedTokenCount == prompt.count + emitted - 1)
+    #expect(iter.mainCacheStorage.processedTokenCount == prompt.count + emitted)
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }
 
@@ -1479,18 +1717,12 @@ func testStoppingEarlyLeavesTheTimelineAtWhatWasEmitted(stopAfter: Int) throws {
     iter.finalizeGeneration()
 
     #expect(emitted == stopAfter)
-    // The `- 1` applies only when the last token emitted was a verifier sample, whose K/V is
-    // deliberately not cached in its own round. Stopping mid-buffer ends on an accepted draft
-    // instead, which *is* cached — so the timeline lands on one of two adjacent values. The half
-    // that matters is the upper bound: describing more than the consumer saw is the failure the
-    // old rewind produced silently past the window.
+    // Finalization commits a verifier sample when needed and rewinds accepted lookahead, so the
+    // retained session describes exactly the sequence the consumer saw.
     let timeline = iter.mainCacheStorage.processedTokenCount
     #expect(
-        timeline <= prompt.count + emitted,
-        "timeline \(timeline) describes tokens beyond the \(emitted) the consumer saw")
-    #expect(
-        timeline >= prompt.count + emitted - 1,
-        "timeline \(timeline) dropped tokens the consumer did see")
+        timeline == prompt.count + emitted,
+        "timeline \(timeline) does not end after the \(emitted) tokens the consumer saw")
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }
 
@@ -1529,9 +1761,8 @@ func testStoppingEarlyOnMixedWidthSlidingLayers(stopAfter: Int) throws {
 
     let timeline = iter.mainCacheStorage.processedTokenCount
     #expect(
-        timeline <= prompt.count + emitted,
-        "timeline \(timeline) describes tokens beyond the \(emitted) the consumer saw")
-    #expect(timeline >= prompt.count + emitted - 1)
+        timeline == prompt.count + emitted,
+        "timeline \(timeline) does not end after the \(emitted) tokens the consumer saw")
     #expect(
         iter.mainCacheStorage.nativeAttentionOffsetsAreAligned,
         "the wide sliding layer stayed ahead of the timeline")
@@ -1557,10 +1788,9 @@ func testDiscardingAGeneratedTokenDoesNotMoveTheTimeline() throws {
     iter.discardGeneratedToken()
     iter.finalizeGeneration()
 
-    // Same two-sided bound as above, and the point is that discarding did not shift it: the
+    // Same exact bound as above, and the point is that discarding did not shift it: the
     // discarded token was returned by `next()` and is genuinely part of the model's context.
     let timeline = iter.mainCacheStorage.processedTokenCount
-    #expect(timeline <= prompt.count + emitted)
-    #expect(timeline >= prompt.count + emitted - 1)
+    #expect(timeline == prompt.count + emitted)
     #expect(iter.mainCacheStorage.nativeAttentionOffsetsAreAligned)
 }

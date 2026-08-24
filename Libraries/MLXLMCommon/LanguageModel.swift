@@ -289,6 +289,39 @@ public struct LMOutput {
     }
 }
 
+/// Greedy decode output produced without retaining a full vocabulary-logit tensor.
+public struct FusedGreedyDecodeOutput {
+    public let tokens: MLXArray
+    public let state: LMOutput.State?
+
+    /// Creates sampled tokens and the model state for the following decode step.
+    public init(tokens: MLXArray, state: LMOutput.State?) {
+        self.tokens = tokens
+        self.state = state
+    }
+}
+
+/// Optional model capability for fusing its output projection with greedy sampling.
+///
+/// Returning `nil` asks ``TokenIterator`` to use regular logits. Implementations must decide
+/// whether they support the call before advancing any cache or recurrent state so that fallback
+/// never evaluates one input twice.
+public protocol FusedGreedyDecodeModel: LanguageModel {
+    /// Evaluates an input and returns its greedy tokens, or `nil` without mutating decode state.
+    ///
+    /// - Parameters:
+    ///   - input: Token input whose final dimension is decoded greedily.
+    ///   - cache: Model cache advanced by a supported fused decode.
+    ///   - state: Model-specific state carried from the previous evaluation.
+    /// - Parameter tokenMask: Optional packed LSB-first token bitmask with one row per input
+    ///   token. A set bit permits the corresponding output token. Implementations that cannot
+    ///   apply the mask must return `nil` before advancing decode state.
+    func fusedGreedyDecode(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?,
+        tokenMask: MLXArray?
+    ) -> FusedGreedyDecodeOutput?
+}
+
 /// The result of the call to ``LanguageModel/prepare(_:cache:state:prefill:)``
 public enum PrepareResult {
     /// tokens to process by the ``TokenIterator``
