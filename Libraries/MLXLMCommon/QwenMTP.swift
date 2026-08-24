@@ -4,13 +4,38 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Normalizes embedded and standalone Qwen MTP checkpoints to the runtime module tree.
 package func qwenMTPSanitizeWeights(
     weights: [String: MLXArray],
     mtpNumHiddenLayers: Int,
     numExperts: Int,
     shiftNormWeights: Bool
 ) -> [String: MLXArray] {
-    var sanitized = weights.filter { key, _ in key.hasPrefix("mtp.") }
+    let standalonePrefixes = [
+        "embed_tokens.",
+        "fc.",
+        "layers.",
+        "norm.",
+        "pre_fc_norm_embedding.",
+        "pre_fc_norm_hidden.",
+    ]
+    let hasEmbeddedTopology = weights.keys.contains { $0.hasPrefix("mtp.") }
+    let hasStandaloneTopology = weights.keys.contains { key in
+        standalonePrefixes.contains { key.hasPrefix($0) }
+    }
+    precondition(
+        !(hasEmbeddedTopology && hasStandaloneTopology),
+        "Qwen MTP checkpoint mixes embedded and standalone predictor weights")
+
+    var sanitized = weights.reduce(into: [String: MLXArray]()) { result, entry in
+        if hasEmbeddedTopology, entry.key.hasPrefix("mtp.") {
+            result[entry.key] = entry.value
+        } else if !hasEmbeddedTopology,
+            standalonePrefixes.contains(where: { entry.key.hasPrefix($0) })
+        {
+            result["mtp.\(entry.key)"] = entry.value
+        }
+    }
 
     for layer in 0 ..< max(mtpNumHiddenLayers, 1) {
         let prefix = "mtp.layers.\(layer).mlp"

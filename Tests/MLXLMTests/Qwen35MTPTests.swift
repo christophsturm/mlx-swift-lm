@@ -71,6 +71,30 @@ func testQwen35StandaloneMTPDoesNotDoubleShiftConvertedNorms() throws {
 }
 
 @Test
+func testQwen35StandaloneMTPPrefixesPublishedFlatPredictorWeights() throws {
+    let cfg = try JSONDecoder().decode(
+        MLXLLM.Qwen35Configuration.self,
+        from: Data(qwen35StandaloneMTPConfigJSON().utf8))
+    let drafter = MLXLLM.Qwen35MTPDraftModel(cfg, preconvertedNorms: true)
+    let norm = MLXArray.zeros([16])
+
+    let sanitized = drafter.sanitize(weights: [
+        "fc.weight": MLXArray.zeros([16, 32]),
+        "layers.0.input_layernorm.weight": norm,
+        "norm.weight": norm,
+        "pre_fc_norm_embedding.weight": norm,
+        "pre_fc_norm_hidden.weight": norm,
+    ])
+
+    #expect(sanitized["fc.weight"] == nil)
+    #expect(sanitized["mtp.fc.weight"]?.shape == [16, 32])
+    #expect(sanitized["mtp.layers.0.input_layernorm.weight"] != nil)
+    let prefixedNorm = try #require(sanitized["mtp.norm.weight"])
+    eval(prefixedNorm)
+    #expect(allClose(prefixedNorm, norm, rtol: 0, atol: 0).item(Bool.self))
+}
+
+@Test
 func testQwen35MTPDraftSanitizeStacksPerExpertMoEWeights() throws {
     let cfg = try JSONDecoder().decode(
         MLXLLM.Qwen35TextConfiguration.self,
