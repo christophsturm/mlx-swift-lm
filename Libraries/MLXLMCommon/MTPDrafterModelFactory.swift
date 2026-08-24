@@ -7,17 +7,17 @@ import MLX
 /// closures that instantiate ``MTPDrafterModel`` instances from `config.json`
 /// data.
 ///
-/// Empty at bootstrap because drafter implementations live in MLXVLM —
-/// importing them here would create a circular dependency. Downstream
-/// modules call ``ModelTypeRegistry/registerModelType(_:creator:)`` on the
-/// shared registry at app/import time. See `Gemma4AssistantRegistration`
-/// in MLXVLM.
+/// Empty at bootstrap because drafter implementations live in MLXLLM and
+/// MLXVLM; importing them here would create a circular dependency. Downstream
+/// modules register target-compatible creators before loading a checkpoint.
 ///
 /// Note: ``ModelTypeRegistry`` is an `actor`; registration is `async`.
 public enum MTPDrafterTypeRegistry {
-    /// Shared registry. Empty until a downstream module registers a drafter
-    /// type via `await MTPDrafterTypeRegistry.shared.registerModelType(...)`.
+    /// Default registry for callers that select creators from checkpoint shape.
     public static let shared: ModelTypeRegistry<any MTPDrafterModel> = .init()
+
+    /// Registry for drafters whose target uses a vision-language runtime.
+    public static let visionLanguage: ModelTypeRegistry<any MTPDrafterModel> = .init()
 }
 
 /// Registry of model id (e.g. `"mlx-community/gemma-4-31B-it-assistant-bf16"`)
@@ -48,6 +48,12 @@ public final class MTPDrafterModelFactory: GenericModelFactory {
 
     public static let shared = MTPDrafterModelFactory(
         typeRegistry: MTPDrafterTypeRegistry.shared,
+        modelRegistry: MTPDrafterRegistry.shared
+    )
+
+    /// Factory that selects drafter implementations compatible with vision-language targets.
+    public static let visionLanguage = MTPDrafterModelFactory(
+        typeRegistry: MTPDrafterTypeRegistry.visionLanguage,
         modelRegistry: MTPDrafterRegistry.shared
     )
 

@@ -10,6 +10,16 @@ import MLXLMCommon
 /// registration; config-shape predicates keep both registrations usable in
 /// the same process.
 public enum Qwen35VLMMTPRegistration {
+    private struct StandaloneConfiguration: Decodable {
+        let textConfiguration: Qwen35Configuration.TextConfiguration
+        let blockSize: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case textConfiguration = "text_config"
+            case blockSize = "block_size"
+        }
+    }
+
     public static func register() async {
         await MTPDrafterTypeRegistry.shared.registerModelType(
             "qwen3_5",
@@ -36,6 +46,28 @@ public enum Qwen35VLMMTPRegistration {
                 let config = try JSONDecoder.json5().decode(
                     Qwen35Configuration.self, from: data)
                 return Qwen35VLMNextNDraftModel(config)
+            }
+        )
+
+        for modelType in ["qwen3_5", "qwen3_5_moe"] {
+            await MTPDrafterTypeRegistry.visionLanguage.registerModelType(
+                modelType,
+                creator: { data in
+                    let config = try JSONDecoder.json5().decode(
+                        Qwen35Configuration.self, from: data)
+                    return Qwen35VLMNextNDraftModel(config)
+                }
+            )
+        }
+        await MTPDrafterTypeRegistry.visionLanguage.registerModelType(
+            "qwen3_5_mtp",
+            creator: { data in
+                let config = try JSONDecoder.json5().decode(
+                    StandaloneConfiguration.self, from: data)
+                return Qwen35VLMNextNDraftModel(
+                    config.textConfiguration,
+                    preconvertedNorms: true,
+                    maximumBlockSize: config.blockSize)
             }
         )
     }

@@ -461,6 +461,18 @@ struct Qwen35MTPMetalTests {
 @Suite(.serialized)
 struct Qwen35MTPRegistrationTests {
     @Test
+    func visionRegistryCreatesStandaloneMTPForAVLMTarget() async throws {
+        await MLXVLM.Qwen35VLMMTPRegistration.register()
+
+        let model = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
+            configuration: Data(qwen35StandaloneMTPConfigJSON().utf8),
+            modelType: "qwen3_5_mtp")
+
+        #expect(model is MLXVLM.Qwen35VLMNextNDraftModel)
+        #expect(model.maximumBlockSize == 3)
+    }
+
+    @Test
     func registrationsCreateTextAndVLMDrafters() async throws {
         await MLXLLM.Qwen35TextMTPRegistration.register()
 

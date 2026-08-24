@@ -8,6 +8,17 @@ import Testing
 
 @Suite("Qwen DFlash checkpoint compatibility")
 struct Qwen3DFlashTests {
+    @Test("DFlash registers for vision-language targets")
+    func registersForVisionLanguageTargets() async throws {
+        await Qwen3DFlashRegistration.register()
+
+        let model = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
+            configuration: Data(dsparkConfigurationJSON().utf8),
+            modelType: "qwen3")
+
+        #expect(model is Qwen3DFlashDraftModel)
+    }
+
     @Test("DSpark normalizes proposal count and adaptive runtime width")
     func decodesDSparkCheckpoint() throws {
         let configuration = try JSONDecoder().decode(

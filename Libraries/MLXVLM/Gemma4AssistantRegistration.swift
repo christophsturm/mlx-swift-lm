@@ -32,14 +32,19 @@ public enum Gemma4AssistantRegistration {
         // `attention_k_eq_v`, `num_global_key_value_heads`), which
         // `Gemma4TextConfiguration` already decodes.
         for modelType in ["gemma4_assistant", "gemma4_unified_assistant"] {
-            await MTPDrafterTypeRegistry.shared.registerModelType(
-                modelType,
-                creator: { data in
-                    let config = try JSONDecoder().decode(
-                        Gemma4AssistantConfiguration.self, from: data)
-                    return Gemma4AssistantDraftModel(config)
-                }
-            )
+            for registry in [
+                MTPDrafterTypeRegistry.shared,
+                MTPDrafterTypeRegistry.visionLanguage,
+            ] {
+                await registry.registerModelType(
+                    modelType,
+                    creator: { data in
+                        let config = try JSONDecoder().decode(
+                            Gemma4AssistantConfiguration.self, from: data)
+                        return Gemma4AssistantDraftModel(config)
+                    }
+                )
+            }
         }
     }
 }

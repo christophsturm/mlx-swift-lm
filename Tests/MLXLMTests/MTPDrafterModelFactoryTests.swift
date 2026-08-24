@@ -49,7 +49,10 @@ func testGemma4AssistantRegistrationRegistersType() async throws {
 
     let model = try await MTPDrafterTypeRegistry.shared.createModel(
         configuration: data, modelType: "gemma4_assistant")
+    let visionModel = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
+        configuration: data, modelType: "gemma4_assistant")
     #expect(model is Gemma4AssistantDraftModel)
+    #expect(visionModel is Gemma4AssistantDraftModel)
 }
 
 @Test
