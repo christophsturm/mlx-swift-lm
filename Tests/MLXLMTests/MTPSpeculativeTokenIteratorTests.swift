@@ -40,6 +40,8 @@ private final class MockDrafter: Module, StatefulMTPDrafterModel {
         super.init()
     }
 
+    func isCompatible(with target: any LanguageModel) -> Bool { true }
+
     func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: [CountingKVCache()])
     }
@@ -313,8 +315,14 @@ private class CountingKVCache: MutableOffsetKVCache {
         set {}
     }
     var metaState: [String] {
-        get { [] }
-        set {}
+        get { [String(offset), wrapAt.map(String.init) ?? ""] }
+        set { offset = newValue.first.flatMap(Int.init) ?? 0 }
+    }
+    static var serializedClassName: String? { "MLXLMTests.MTPCountingKVCache" }
+    static func restore(state: [MLXArray], metaState: [String]) throws -> any KVCache {
+        let cache = CountingKVCache(wrapAt: metaState.dropFirst().first.flatMap(Int.init))
+        cache.metaState = metaState
+        return cache
     }
     var isTrimmable: Bool {
         isTrimmable(after: 0)
@@ -423,6 +431,7 @@ func testSpeculativePromptCacheRestoresTargetAndDrafterTogether() throws {
     #expect(restored.sessionState.processedTokenCount == sessionState.processedTokenCount)
     #expect(restored.sessionState.tokenHistory == sessionState.tokenHistory)
     #expect(restored.sessionState.cache.count == sessionState.cache.count)
+    #expect(restored.sessionState.cache.map(\.offset) == sessionState.cache.map(\.offset))
     #expect(restored.sessionState.drafterState?.cache.count == sessionState.drafterState?.cache.count)
     #expect(
         restored.sessionState.drafterState?.nextPosition
@@ -456,6 +465,36 @@ func testFinalSingleTokenBudgetKeepsStatefulDrafterAligned() throws {
     #expect(drafter.appendedPromptTokenCounts == [0])
     #expect(iterator.drafterState != nil)
     #expect(iterator.mainCacheStorage.processedTokenCount == prompt.count + 2)
+}
+
+// MARK: - Prefill reporting
+
+private final class PrefixLog: @unchecked Sendable {
+    var positions: [Int] = []
+}
+
+@Suite("MTP prefill reporting")
+struct MTPPrefillReportingTests {
+    @Test("the main cache's prefix is reported once")
+    func reusedPrefix() throws {
+        let main = MockMainModel(nextLogitTokens: [0, 0, 7])
+        let drafter = MockDrafter(draftedTokenValue: 7)
+        let log = PrefixLog()
+        var parameters = GenerateParameters(maxTokens: 1)
+        parameters.prefill = PrefillParameters(prefix: { log.positions.append($0) })
+        let warmCache = KVCacheSimple()
+        warmCache.offset = 2
+
+        _ = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+            mainModel: main,
+            drafter: drafter,
+            mainCache: [warmCache],
+            parameters: parameters,
+            blockSize: 4)
+
+        #expect(log.positions == [2])
+    }
 }
 
 // MARK: - Smallest-unit-of-work smoke test

@@ -819,8 +819,12 @@ public final class Qwen3DFlashDraftModel: Module, StatefulMTPDrafterModel {
         super.init()
     }
 
+    public func isCompatible(with target: any LanguageModel) -> Bool {
+        (try? requireCompatibility(with: target)) != nil
+    }
+
     /// Verifies the target dimensions encoded in the standalone checkpoint.
-    public func validateTarget(_ target: any LanguageModel) throws {
+    public func requireCompatibility(with target: any LanguageModel) throws {
         guard let target = target as? any DFlashTargetModel else {
             throw DFlashTargetCompatibilityError.unsupportedTarget(
                 String(describing: type(of: target)))

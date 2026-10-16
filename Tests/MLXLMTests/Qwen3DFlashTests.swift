@@ -162,7 +162,7 @@ struct Qwen3DFlashTests {
         let target = Qwen35TextModel(targetConfiguration)
         var state = drafter.makeState(parameters: nil)
 
-        try drafter.validateTarget(target)
+        try drafter.requireCompatibility(with: target)
         let tokens = drafter.draftBlock(
             target: target,
             lastToken: MLXArray([4]),
@@ -177,6 +177,35 @@ struct Qwen3DFlashTests {
         eval(tokens)
         #expect(tokens.shape == [1, 2])
         #expect(tokens.asArray(Int.self).allSatisfy { (0 ..< 32).contains($0) })
+    }
+
+    @Test("A speculative session reports which target dimension a DFlash checkpoint misses")
+    func sessionReportsTheMismatchedTargetDimension() throws {
+        let drafter = Qwen3DFlashDraftModel(
+            try JSONDecoder().decode(
+                Qwen3DFlashConfiguration.self, from: Data(dflash2ConfigurationJSON().utf8)))
+        let matching = Qwen35TextModel(
+            try JSONDecoder().decode(
+                Qwen35TextConfiguration.self,
+                from: Data(qwen35DFlashTargetConfigurationJSON().utf8)))
+        let deeper = Qwen35TextModel(
+            try JSONDecoder().decode(
+                Qwen35TextConfiguration.self, from: Data(qwen35CaptureConfigurationJSON().utf8)))
+
+        #expect(drafter.isCompatible(with: matching))
+        #expect(!drafter.isCompatible(with: deeper))
+        #expect(throws: DFlashTargetCompatibilityError.layerCount(drafter: 2, target: 3)) {
+            _ = try MTPSpeculativeSessionState(
+                mainModel: deeper, drafter: drafter, parameters: GenerateParameters())
+        }
+        #expect(throws: DFlashTargetCompatibilityError.layerCount(drafter: 2, target: 3)) {
+            _ = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: MLXArray([Int32(1), 2, 3])),
+                mainModel: deeper,
+                drafter: drafter,
+                parameters: GenerateParameters(temperature: 0),
+                blockSize: 3)
+        }
     }
 
     @Test("A global draft window bounds every DFlash layer cache")

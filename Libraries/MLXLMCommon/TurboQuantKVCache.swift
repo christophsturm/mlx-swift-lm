@@ -637,7 +637,27 @@ class MSECodec {
 ///   all compressed tokens. Zero dequantization.
 ///
 /// Both keys and values: Algorithm 1 (MSE at b bits, no QJL)
-public class TurboQuantKVCache: BaseKVCache {
+public class TurboQuantKVCache: BaseKVCache, SharedAttentionKVCache {
+    public override class var serializedClassName: String? { "TurboQuantKVCache" }
+
+    public override class func restore(
+        state: [MLXArray], metaState: [String]
+    ) throws -> any KVCache {
+        guard metaState.count >= 5,
+            let bits = Int(metaState[1]),
+            let keyBits = Int(metaState[2]),
+            let valueBits = Int(metaState[3]),
+            let seed = UInt64(metaState[4])
+        else {
+            throw KVCacheError(
+                message: "Invalid TurboQuantKVCache metaState")
+        }
+        let cache = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed)
+        cache.state = state
+        cache.metaState = metaState
+        return cache
+    }
 
     public let bits: Int  // Legacy: used when keyBits == valueBits
     public let keyBits: Int  // Bit-width for key compression (0 = raw FP16, no compression)
@@ -1175,44 +1195,56 @@ public class TurboQuantKVCache: BaseKVCache {
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
     ) -> MLXArray {
-        // Transition: compress raw cache on first decode call
+        appendCompressed(keys: newKeys, values: newValues)
+        return attend(queries: queries, scale: scale, mask: mask)
+    }
+
+    private func appendCompressed(keys: MLXArray, values: MLXArray) {
         if !isCompressed {
             compressRawCache()
         }
-
-        // Phase A: Encode new token
-        encodeNewToken(keys: newKeys, values: newValues)
-
-        return compressedAttention(queries: queries, scale: scale, mask: mask)
+        encodeNewToken(keys: keys, values: values)
+        isCompressed = true
     }
 
-    /// Runs compressed-domain attention against the current cache without appending K/V.
-    ///
-    /// KV-sharing architectures use this after the owning layer has appended the current
-    /// token. The cache must already be compressed and contain at least one token.
-    public func compressedAttention(
-        queries: MLXArray,
-        scale: Float,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
-    ) -> MLXArray {
-        precondition(
-            isCompressed && offset > 0,
-            "Cached-only TurboQuant attention requires a non-empty compressed cache")
+    package func updateForAttention(keys: MLXArray, values: MLXArray) {
+        if keys.dim(2) > 1 && !isCompressed {
+            _ = update(keys: keys, values: values)
+        } else {
+            appendCompressed(keys: keys, values: values)
+        }
+    }
 
-        guard let storedValues = valPackedMSE, let valueMSECodec else {
+    package func attend(
+        queries: MLXArray, scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        if !isCompressed {
+            guard let rawKeys, let rawValues else {
+                preconditionFailure("TurboQuant attention requires populated KV")
+            }
+            return MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: rawKeys[.ellipsis, ..<offset, 0...],
+                values: rawValues[.ellipsis, ..<offset, 0...],
+                scale: scale, mask: mask)
+        }
+
+        guard let valueMSECodec else {
             return queries
         }
 
         let headDim = queries.dim(-1)
         let B = queries.dim(0)
         let nQHeads = queries.dim(1)
-        let nKVHeads = storedValues.dim(1)
+        let nKVHeads = valPackedMSE!.dim(1)
         let L = queries.dim(2)
         let nRepeats = nQHeads / nKVHeads
+
         let tokenCount = offset
 
         // Shared V slicing (used by all paths)
-        let flatValPacked = storedValues[0..., 0..., ..<tokenCount, 0...]
+        let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
         let flatValNorms = valNorms![0..., 0..., ..<tokenCount]
             .reshaped([B * nKVHeads, tokenCount])
@@ -1474,23 +1506,17 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
     /// In rawKeyMode: rawKeys is always present (FP16 keys), no keyPackedMSE/keyNorms.
     public var memoryBytes: Int {
-        var total = 0
-        // Raw FP16 buffers (always present in rawKeyMode for keys, or during prefill)
-        if let rk = rawKeys { total += rk.shape.reduce(1, *) * rk.dtype.bytesPerElement }
-        if let rv = rawValues { total += rv.shape.reduce(1, *) * rv.dtype.bytesPerElement }
-        // Compressed storage (K only present when NOT rawKeyMode)
-        if let kw = affKeyW { total += kw.shape.reduce(1, *) * kw.dtype.bytesPerElement }
-        if let ks = affKeyScales { total += ks.shape.reduce(1, *) * ks.dtype.bytesPerElement }
-        if let kb = affKeyBiases { total += kb.shape.reduce(1, *) * kb.dtype.bytesPerElement }
-        if let kp = keyPackedMSE { total += kp.shape.reduce(1, *) * kp.dtype.bytesPerElement }
-        if let kn = keyNorms { total += kn.shape.reduce(1, *) * kn.dtype.bytesPerElement }
-        if let vp = valPackedMSE { total += vp.shape.reduce(1, *) * vp.dtype.bytesPerElement }
-        if let vn = valNorms { total += vn.shape.reduce(1, *) * vn.dtype.bytesPerElement }
-        if let kcs = keyCalibScale { total += kcs.shape.reduce(1, *) * kcs.dtype.bytesPerElement }
-        return total
+        innerState().reduce(0) { $0 + $1.nbytes }
     }
 
     // MARK: - State / Trim
+
+    override public func innerState() -> [MLXArray] {
+        [
+            rawKeys, rawValues, affKeyW, affKeyScales, affKeyBiases,
+            keyPackedMSE, keyNorms, valPackedMSE, valNorms, keyCalibScale,
+        ].compactMap { $0 }
+    }
 
     override public var state: [MLXArray] {
         get {
@@ -1622,6 +1648,32 @@ public class TurboQuantKVCache: BaseKVCache {
             isCompressed = false
         }
         return trimCount
+    }
+
+    override public func copy() -> any KVCache {
+        let new = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed,
+            keyGroupSize: keyGroupSize)
+        new.offset = offset
+        new.keyMSECodec = keyMSECodec
+        new.valueMSECodec = valueMSECodec
+        // Like `state`, keep only the positions this cache holds. A slice is a new array
+        // object, so a write to either cache rebinds only its own arrays.
+        func held(_ array: MLXArray?) -> MLXArray? { array?[0..., 0..., ..<offset] }
+        new.affKeyW = held(affKeyW)
+        new.affKeyScales = held(affKeyScales)
+        new.affKeyBiases = held(affKeyBiases)
+        new.rawKeys = held(rawKeys)
+        new.rawValues = held(rawValues)
+        new.rawAllocSteps = new.rawKeys?.dim(2) ?? 0
+        new.keyPackedMSE = held(keyPackedMSE)
+        new.keyNorms = held(keyNorms)
+        new.valPackedMSE = held(valPackedMSE)
+        new.valNorms = held(valNorms)
+        new.compressedAllocSteps = new.valPackedMSE?.dim(2) ?? 0
+        new.keyCalibScale = keyCalibScale?[.ellipsis]
+        new.isCompressed = isCompressed
+        return new
     }
 }
 

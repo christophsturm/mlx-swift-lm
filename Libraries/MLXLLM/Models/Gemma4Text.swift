@@ -423,7 +423,7 @@ private class Gemma4Attention: Module {
                         mode: mode
                     )
                 case .turboQuant(let cache):
-                    cache.compressedAttention(
+                    cache.attend(
                         queries: queries, scale: scale, mask: adjustedMask ?? .none)
                 }
         }
@@ -903,8 +903,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             out = model.embedTokens.asLinear(out)
         }
-        out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
-        return out
+        return gemma4LogitSoftcap(out, config.finalLogitSoftcapping)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -998,8 +997,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 // MARK: - LoRA
 
 extension Gemma4TextModel: LoRAModel {
+    /// Decoder layers, not just attention: LoRA keys are matched against the
+    /// children of each returned module, so `mlp.*` targets only resolve when
+    /// the layer itself is returned (as Gemma3Text / Qwen35 / Llama do).
     public var loraLayers: [Module] {
-        model.layers.map { $0.selfAttn }
+        model.layers
     }
 }
 

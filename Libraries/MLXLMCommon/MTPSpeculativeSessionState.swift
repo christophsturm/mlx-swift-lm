@@ -48,7 +48,7 @@ public final class MTPSpeculativeSessionState: @unchecked Sendable {
         parameters: GenerateParameters
     ) throws {
         precondition(processedTokenCount.map { $0 >= 0 } ?? true)
-        try drafter.validateTarget(mainModel)
+        try drafter.requireCompatibility(with: mainModel)
         let plan = try parameters.kvCachePlan()
         let cache = try plan.validated(
             mainCache ?? (try mainModel.newCache(parameters: parameters)))

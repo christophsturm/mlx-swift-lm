@@ -22,7 +22,7 @@ extension UserInput.Audio {
 
     public func asMLXArray(processing: UserInput.AudioProcessing = .init()) async throws -> MLXArray
     {
-        switch self {
+        switch source {
         case .url(let url):
             #if canImport(AVFoundation)
             let asset = AVURLAsset(url: url)
@@ -66,25 +66,35 @@ extension UserInput.Audio {
             fatalError("Audio processing is not supported on this platform.")
             #endif
         case .array(let array, let sourceSampleRate):
-            guard let sourceSampleRate, sourceSampleRate != processing.sampleRate else {
-                return array
-            }
-            guard sourceSampleRate > 0, processing.sampleRate > 0 else {
-                throw AudioArrayConversionError.invalidSampleRate(
-                    source: sourceSampleRate,
-                    target: processing.sampleRate
-                )
-            }
-            #if canImport(AVFoundation)
-            return try Self.resample(
-                array,
-                from: sourceSampleRate,
-                to: processing.sampleRate
-            )
-            #else
-            throw AudioArrayConversionError.unsupportedPlatform
-            #endif
+            return try Self.samples(
+                array, sampleRate: sourceSampleRate, convertedTo: processing.sampleRate)
         }
+    }
+
+    /// In-memory samples at `targetSampleRate`, resampled when `sampleRate` names another rate.
+    ///
+    /// - Parameters:
+    ///   - array: Mono PCM samples.
+    ///   - sampleRate: The samples' rate, or `nil` when they are already at `targetSampleRate`.
+    ///   - targetSampleRate: The rate the caller reads.
+    package static func samples(
+        _ array: MLXArray, sampleRate sourceSampleRate: Double?,
+        convertedTo targetSampleRate: Double
+    ) throws -> MLXArray {
+        guard let sourceSampleRate, sourceSampleRate != targetSampleRate else {
+            return array
+        }
+        guard sourceSampleRate > 0, targetSampleRate > 0 else {
+            throw AudioArrayConversionError.invalidSampleRate(
+                source: sourceSampleRate,
+                target: targetSampleRate
+            )
+        }
+        #if canImport(AVFoundation)
+        return try resample(array, from: sourceSampleRate, to: targetSampleRate)
+        #else
+        throw AudioArrayConversionError.unsupportedPlatform
+        #endif
     }
 
     #if canImport(AVFoundation)

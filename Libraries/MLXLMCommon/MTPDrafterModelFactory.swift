@@ -16,7 +16,10 @@ public enum MTPDrafterTypeRegistry {
     /// Default registry for callers that select creators from checkpoint shape.
     public static let shared: ModelTypeRegistry<any MTPDrafterModel> = .init()
 
-    /// Registry for drafters whose target uses a vision-language runtime.
+    /// Registry for drafters whose forward pass consumes multimodal position
+    /// state. It is separate from ``shared`` because standalone Qwen MTP
+    /// checkpoints intentionally ship an empty `vision_config`, so their
+    /// target architecture cannot be inferred from drafter metadata alone.
     public static let visionLanguage: ModelTypeRegistry<any MTPDrafterModel> = .init()
 }
 
@@ -32,9 +35,12 @@ public class MTPDrafterRegistry: AbstractModelRegistry, @unchecked Sendable {
     public static let gemma4_31B_assistant_bf16 = ModelConfiguration(
         id: "mlx-community/gemma-4-31B-it-assistant-bf16"
     )
+    public static let qwen3_8_27b_mtp_4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.8-27B-MTP-4bit"
+    )
 
     private static func all() -> [ModelConfiguration] {
-        [gemma4_26B_assistant_bf16, gemma4_31B_assistant_bf16]
+        [gemma4_26B_assistant_bf16, gemma4_31B_assistant_bf16, qwen3_8_27b_mtp_4bit]
     }
 }
 
@@ -51,7 +57,8 @@ public final class MTPDrafterModelFactory: GenericModelFactory {
         modelRegistry: MTPDrafterRegistry.shared
     )
 
-    /// Factory that selects drafter implementations compatible with vision-language targets.
+    /// Loader for multimodal drafters. Use this factory when the verifier was
+    /// loaded by `VLMModelFactory` and can emit multimodal RoPE deltas.
     public static let visionLanguage = MTPDrafterModelFactory(
         typeRegistry: MTPDrafterTypeRegistry.visionLanguage,
         modelRegistry: MTPDrafterRegistry.shared
@@ -98,10 +105,11 @@ public final class MTPDrafterModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        try loadWeights(
+        try await loadWeights(
             modelDirectory: modelDirectory, model: model,
             perLayerQuantization: baseConfig.perLayerQuantization,
-            weightFileSelection: configuration.weightFileSelection
+            weightFileSelection: configuration.weightFileSelection,
+            excludedComponents: configuration.excludedComponents
         )
 
         let modelConfig = ModelConfiguration(

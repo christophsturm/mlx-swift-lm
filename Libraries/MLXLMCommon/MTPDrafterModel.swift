@@ -26,6 +26,10 @@ import MLXNN
 /// instance. Drafters that need their own per-stream state additionally
 /// conform to ``StatefulMTPDrafterModel``.
 public protocol MTPDrafterModel: BaseLanguageModel {
+    /// Whether the drafter can consume hidden states and model-owned values
+    /// from this target architecture.
+    func isCompatible(with target: any LanguageModel) -> Bool
+
     /// Largest total verification block the drafter can produce efficiently.
     /// `nil` means the caller may choose any block size.
     var maximumBlockSize: Int? { get }
@@ -56,8 +60,12 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// Smallest useful adaptive verification width, including the target anchor.
     var adaptiveBlockSizeMinimum: Int { get }
 
-    /// Rejects target/drafter pairs whose dimensions or cache semantics are incompatible.
-    func validateTarget(_ target: any LanguageModel) throws
+    /// Throws when ``isCompatible(with:)`` rejects `target`.
+    ///
+    /// The default reports a generic incompatibility. Drafters whose compatibility depends on
+    /// checkpoint dimensions override it to report the specific mismatch and derive
+    /// ``isCompatible(with:)`` from it, so each drafter keeps a single compatibility check.
+    func requireCompatibility(with target: any LanguageModel) throws
 
     /// K-step drafting from a constant position.
     ///
@@ -108,7 +116,14 @@ extension MTPDrafterModel {
     public var consumesTargetHiddenHistory: Bool { false }
     public var adaptiveBlockSizeInitial: Int? { nil }
     public var adaptiveBlockSizeMinimum: Int { 4 }
-    public func validateTarget(_: any LanguageModel) throws {}
+
+    public func requireCompatibility(with target: any LanguageModel) throws {
+        guard isCompatible(with: target) else {
+            throw ModelFactoryError.invalidConfiguration(
+                "MTP drafter \(type(of: self)) is incompatible with target "
+                    + "\(type(of: target))")
+        }
+    }
 }
 
 /// Target-side surface used by DFlash-family drafters without retaining target modules.

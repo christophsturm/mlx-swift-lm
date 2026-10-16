@@ -17,6 +17,10 @@ final class Qwen35VLMNextNPredictor: Module {
         var mtpArgs = args
         mtpArgs.hiddenLayers = max(args.mtpNumHiddenLayers, 1)
         mtpArgs.fullAttentionInterval = 1
+        let layerTypes = Array(
+            repeating: HybridAttentionSchedule.fullAttention, count: mtpArgs.hiddenLayers)
+        mtpArgs.layerTypes = layerTypes
+        mtpArgs.resolvedLayerTypes = layerTypes
 
         if args.mtpUseDedicatedEmbeddings {
             _embedTokens.wrappedValue = Embedding(
@@ -81,17 +85,30 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
-    private let preconvertedNorms: Bool
+    private let checkpointPolicy: Qwen35CheckpointPolicy
 
     @ModuleInfo(key: "mtp") var mtp: Qwen35VLMNextNPredictor
 
-    public init(
+    public convenience init(
         _ configuration: Qwen35Configuration.TextConfiguration,
         preconvertedNorms: Bool = false,
         maximumBlockSize: Int? = nil
     ) {
+        self.init(
+            configuration,
+            checkpointPolicy: .init(
+                modelType: configuration.modelType,
+                preconvertedNorms: preconvertedNorms),
+            maximumBlockSize: maximumBlockSize)
+    }
+
+    package init(
+        _ configuration: Qwen35Configuration.TextConfiguration,
+        checkpointPolicy: Qwen35CheckpointPolicy,
+        maximumBlockSize: Int? = nil
+    ) {
         self.configuration = configuration
-        self.preconvertedNorms = preconvertedNorms
+        self.checkpointPolicy = checkpointPolicy
         self.maximumBlockSize =
             maximumBlockSize
             ?? Swift.max(configuration.mtpNumHiddenLayers, 1) + 2
@@ -105,12 +122,18 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
     ) {
         self.init(
             configuration.textConfiguration,
-            preconvertedNorms: preconvertedNorms,
+            checkpointPolicy: .init(
+                modelType: configuration.modelType,
+                preconvertedNorms: preconvertedNorms),
             maximumBlockSize: configuration.blockSize)
     }
 
     public func makeState(parameters: GenerateParameters?) -> MTPDrafterState {
         MTPDrafterState(cache: mtp.newCache())
+    }
+
+    public func isCompatible(with target: any LanguageModel) -> Bool {
+        target is Qwen35
     }
 
     public func prepareDrafterState(
@@ -296,14 +319,26 @@ public final class Qwen35VLMNextNDraftModel: Module, StatefulMTPDrafterModel {
         rewindQwenMTPDrafterState(toNextPosition: nextPosition, state: &state)
     }
 
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        qwenMTPSanitizeWeights(
-            weights: weights,
-            mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
-            numExperts: configuration.numExperts,
-            shiftNormWeights: !preconvertedNorms
-        )
+    public var excludedCheckpointNamespaces: [String] {
+        checkpointPolicy.excludedCheckpointNamespaces
     }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        try checkpointPolicy.prepare(
+            checkpoint, mtpNumHiddenLayers: configuration.mtpNumHiddenLayers,
+            numExperts: configuration.numExperts)
+    }
+
+    public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        try sanitize(weights: weights, metadata: [:])
+    }
+
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
+        MLXArray]
+    {
+        try prepareCheckpoint(.init(weights: weights, metadata: metadata)).weights
+    }
+
 }
 
 func qwen35MTPPositionIds(
@@ -328,4 +363,10 @@ func qwen35MTPPositionIds(
         base = base + delta[0..., .newAxis]
     }
     return tiled(base[.newAxis, 0..., 0...], repetitions: [3, 1, 1])
+}
+
+extension Qwen35VLMNextNDraftModel: ModelConversionMetadataProvider {
+    public var modelConversionMetadata: [String: String] {
+        [Qwen35CheckpointPolicy.normMetadataKey: "scale"]
+    }
 }
