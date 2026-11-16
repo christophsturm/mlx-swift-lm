@@ -373,6 +373,13 @@ private class MuseGlimmerTextMLP: Module, UnaryLayer {
         // Compiled `silu(gate) * up` — identical arithmetic, one kernel.
         downProj(compiledSiluProduct(gateProj(x), upProj(x)))
     }
+
+    /// `callAsFunction` over a verification block, each row as one-token decode computes it.
+    func exactSpeculativeForward(_ x: MLXArray) -> MLXArray {
+        let projections = exactSpeculativeLinears([gateProj, upProj], x)
+        return exactSpeculativeLinear(
+            downProj, compiledSiluProduct(projections[0], projections[1]))
+    }
 }
 
 private class MuseGlimmerTextAttention: Module {
@@ -476,6 +483,41 @@ private class MuseGlimmerTextAttention: Module {
         output = _sigmoidGate(output, gateProj(x))
         return outputProj(output)
     }
+
+    /// `callAsFunction` over a verification block, each row as one-token decode computes it:
+    /// projections accumulate per row, and each row attends after the rows before it under
+    /// the mask decode builds for it (`windowSize` on sliding layers).
+    func exactSpeculativeForward(_ x: MLXArray, cache: KVCache, windowSize: Int?) -> MLXArray {
+        let (batch, length) = (x.dim(0), x.dim(1))
+        let projections = exactSpeculativeLinears([queryProj, keyProj, valueProj, gateProj], x)
+
+        var queries = qkNorm(projections[0].reshaped(batch, length, heads, headDimensions))
+        queries = (queries.asType(.float32) * qkScaleFactor)
+            .asType(queries.dtype).transposed(0, 2, 1, 3)
+        let keys = qkNorm(projections[1].reshaped(batch, length, kvHeads, headDimensions))
+            .transposed(0, 2, 1, 3)
+        let values = projections[2].reshaped(batch, length, kvHeads, headDimensions)
+            .transposed(0, 2, 1, 3)
+
+        let (attending, staging) = decodeEquivalentRowCache(for: cache)
+        let rows = (0 ..< length).map { row in
+            var rowQueries = queries[0..., 0..., row ..< (row + 1), 0...]
+            var rowKeys = keys[0..., 0..., row ..< (row + 1), 0...]
+            let rowValues = values[0..., 0..., row ..< (row + 1), 0...]
+            if useRope {
+                rowQueries = rope(rowQueries, offset: attending.offset)
+                rowKeys = rope(rowKeys, offset: attending.offset)
+            }
+            let mask = attending.makeMask(n: 1, windowSize: windowSize, returnArray: false)
+            _ = staging?.update(keys: rowKeys, values: rowValues)
+            return attentionWithCacheUpdate(
+                queries: rowQueries, keys: rowKeys, values: rowValues, cache: attending,
+                scale: scale, mask: mask)
+        }
+        let output = concatenated(rows, axis: 2).transposed(0, 2, 1, 3)
+            .reshaped(batch, length, -1)
+        return exactSpeculativeLinear(outputProj, _sigmoidGate(output, projections[3]))
+    }
 }
 
 private class MuseGlimmerDecoderLayer: Module {
@@ -519,6 +561,17 @@ private class MuseGlimmerDecoderLayer: Module {
         h = postFeedforwardLayerNorm.addedTo(h, mlp(preFeedforwardLayerNorm(h)))
         return h
     }
+
+    /// `callAsFunction` over a verification block, each row as one-token decode computes it.
+    func exactSpeculativeForward(_ x: MLXArray, cache: KVCache, windowSize: Int?) -> MLXArray {
+        var h = postAttentionLayerNorm.addedTo(
+            x,
+            selfAttention.exactSpeculativeForward(
+                inputLayerNorm(x), cache: cache, windowSize: windowSize))
+        h = postFeedforwardLayerNorm.addedTo(
+            h, mlp.exactSpeculativeForward(preFeedforwardLayerNorm(h)))
+        return h
+    }
 }
 
 private class MuseGlimmerTextModel: Module {
@@ -560,10 +613,7 @@ private class MuseGlimmerTextModel: Module {
         inputEmbedding: MLXArray? = nil,
         captureLayerIDs: [Int] = []
     ) -> (hidden: MLXArray, captured: [MLXArray]) {
-        precondition(
-            Set(captureLayerIDs).count == captureLayerIDs.count
-                && captureLayerIDs.allSatisfy { layers.indices.contains($0) },
-            "Muse Glimmer capture layers must be unique and in range")
+        checkCaptureLayerIDs(captureLayerIDs)
         var h: MLXArray
         if let inputEmbedding {
             h = inputEmbedding
@@ -592,6 +642,30 @@ private class MuseGlimmerTextModel: Module {
             }
         }
         return (norm(h), captureLayerIDs.map { captured[$0]! })
+    }
+
+    /// `callAsFunction` over a verification block, each row as one-token decode computes it.
+    func exactSpeculativeForward(
+        _ inputs: MLXArray, cache: [KVCache], captureLayerIDs: [Int]
+    ) -> (hidden: MLXArray, captured: [MLXArray]) {
+        checkCaptureLayerIDs(captureLayerIDs)
+        var h = embedNorm(embedTokens(inputs))
+        var captured = [Int: MLXArray]()
+        for (i, layer) in layers.enumerated() {
+            h = layer.exactSpeculativeForward(
+                h, cache: cache[i], windowSize: layer.isSliding ? config.slidingWindow : nil)
+            if captureLayerIDs.contains(i) {
+                captured[i] = h
+            }
+        }
+        return (norm(h), captureLayerIDs.map { captured[$0]! })
+    }
+
+    private func checkCaptureLayerIDs(_ captureLayerIDs: [Int]) {
+        precondition(
+            Set(captureLayerIDs).count == captureLayerIDs.count
+                && captureLayerIDs.allSatisfy { layers.indices.contains($0) },
+            "Muse Glimmer capture layers must be unique and in range")
     }
 }
 
@@ -631,19 +705,40 @@ private class MuseGlimmerLanguageModel: Module, KVCacheDimensionProvider {
         state: LMOutput.State? = nil,
         emittedRows: Int? = nil
     ) -> LMOutput {
-        let emitDrafterState = state?[mtpEmitFlagKey] ?? false
-        let captureLayerIDs = emitDrafterState ? (state?[mtpTargetLayerIdsKey] ?? []) : []
         let optionalCache = cache?.map { $0 as KVCache? }
         let (out, captured) = model(
             inputs, cache: optionalCache, inputEmbedding: inputEmbedding,
-            captureLayerIDs: captureLayerIDs)
+            captureLayerIDs: captureLayerIDs(state))
+        return output(
+            out, headLogits: lmHead(out), captured: captured, state: state,
+            emittedRows: emittedRows)
+    }
 
-        var logits = lmHead(out) * config.outputMultiplier
+    /// `callAsFunction` over a verification block, each row as one-token decode computes it.
+    func exactSpeculativeForward(
+        _ inputs: MLXArray, cache: [KVCache], state: LMOutput.State?
+    ) -> LMOutput {
+        let (out, captured) = model.exactSpeculativeForward(
+            inputs, cache: cache, captureLayerIDs: captureLayerIDs(state))
+        return output(
+            out, headLogits: exactSpeculativeLinear(lmHead, out), captured: captured,
+            state: state, emittedRows: nil)
+    }
+
+    private func captureLayerIDs(_ state: LMOutput.State?) -> [Int] {
+        (state?[mtpEmitFlagKey] ?? false) ? (state?[mtpTargetLayerIdsKey] ?? []) : []
+    }
+
+    private func output(
+        _ out: MLXArray, headLogits: MLXArray, captured: [MLXArray],
+        state: LMOutput.State?, emittedRows: Int?
+    ) -> LMOutput {
+        var logits = headLogits * config.outputMultiplier
         let cap = config.finalLogitSoftcapping
         if cap > 0 {
             logits = tanh(logits / cap) * cap
         }
-        guard emitDrafterState else { return LMOutput(logits: logits) }
+        guard state?[mtpEmitFlagKey] ?? false else { return LMOutput(logits: logits) }
 
         // Each layer is cut before concatenating, so no full-length copy outlives the forward.
         func emitted(_ hidden: MLXArray) -> MLXArray {
@@ -1337,6 +1432,20 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             result[key] = value
         }
         return result
+    }
+}
+
+extension MuseGlimmer: ExactSpeculativeVerificationModel {
+    /// Verifies a speculative block so that every row equals one-token decode: a plain
+    /// multi-token forward accumulates its projections and attention differently, and its
+    /// logits would make speculative output differ from target-only output.
+    public func verifySpeculativeBlock(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        guard let cache else {
+            preconditionFailure("Muse Glimmer verifies a speculative block against a target cache")
+        }
+        return languageModel.exactSpeculativeForward(input.tokens, cache: cache, state: state)
     }
 }
 

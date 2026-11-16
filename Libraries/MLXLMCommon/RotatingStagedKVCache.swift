@@ -4,6 +4,21 @@ import Foundation
 import MLX
 import MLXNN
 
+/// The cache through which a speculative block attends one row at a time to match one-token
+/// decode, and the round cache that must also receive each row when that is a different one.
+///
+/// A staged rotating leaf presents its live window followed by every staged row, which one-token
+/// decode never sees. Its rows therefore attend through a copy of the live ring, which each
+/// one-row write advances exactly as decode advances the ring itself.
+package func decodeEquivalentRowCache(
+    for cache: KVCache
+) -> (attending: KVCache, staging: KVCache?) {
+    guard let staged = cache as? RotatingStagedKVCache else { return (cache, nil) }
+    precondition(
+        staged.stagedCount == 0, "Decode-equivalent rows must start a speculative round")
+    return (staged.live.copy(), staged)
+}
+
 /// A ``RotatingKVCache`` presented with uncommitted rows appended.
 ///
 /// `update(keys:values:)` stages its arguments instead of writing them and returns the trailing
