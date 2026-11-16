@@ -1091,8 +1091,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             stepState?[mtpEmitFlagKey] = true
             stepState?[mtpTargetLayerIdsKey] = drafter.targetLayerIds
         }
+        // A drafter that consumes hidden history has not yet seen the rows of the last round.
+        let pendingHistory =
+            maintainingDrafterState && drafter.consumesTargetHiddenHistory
+            ? mainState?[mtpLastHiddenStatesKey] : nil
         let result = mainModel(y[text: .newAxis], cache: mainCache, state: stepState)
         mainState = result.state
+        if let pendingHistory, let stepHidden = mainState?[mtpLastHiddenStatesKey] {
+            mainState?[mtpLastHiddenStatesKey] = concatenated([pendingHistory, stepHidden], axis: 1)
+        }
         mainCacheStorage.commitProcessedTokens(y.cacheSequenceLength)
         sessionState.recordCommittedTokens(committedTokens)
         var logits = result.logits[0..., -1, 0...]

@@ -141,6 +141,30 @@ struct MuseGlimmerDFlashGenerationTests {
         #expect(speculative.acceptedCount > 0)
         #expect(speculative.acceptedCount < speculative.proposedCount)
     }
+
+    /// Every committed target position hands its hidden row to the assistant once: the
+    /// assistant's context cache holds it, or it waits for the next draft. With every
+    /// proposal rejected, each round emits one token, so the last token of the budget comes
+    /// from a single target-only step.
+    @Test("A one-token tail keeps every target hidden row for the assistant")
+    func oneTokenTailKeepsAssistantContext() throws {
+        let (target, drafter) = try seededMuseDFlashPair()
+        let prompt = MLXArray([Int32(3), 17, 42, 5, 29, 11])
+        let parameters = GenerateParameters(maxTokens: 9, temperature: 0)
+        let session = try MTPSpeculativeSessionState(
+            mainModel: target, drafter: drafter, parameters: parameters)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: target, drafter: drafter,
+            sessionState: session, parameters: parameters, blockSize: 4)
+        while iterator.next() != nil {}
+        iterator.finalizeGeneration()
+
+        let consumed = try #require(session.drafterState?.cache.first?.offset)
+        let pending = try #require(session.mainState?[mtpLastHiddenStatesKey]).dim(1)
+        #expect(iterator.acceptedCount == 0)
+        #expect(iterator.tokenCount == 9)
+        #expect(consumed + pending == session.processedTokenCount)
+    }
 }
 
 /// Tokens a plain target-only iterator generates.
