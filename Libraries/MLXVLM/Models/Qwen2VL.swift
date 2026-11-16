@@ -1291,6 +1291,7 @@ public struct Qwen2VLMessageGenerator: MessageGenerator {
             "role": message.role.rawValue,
             "content": contentParts(for: message, layout: .imagesThenVideosThenText),
         ]
+        addReasoning(to: &dictionary, for: message)
         addToolMetadata(to: &dictionary, for: message)
         return dictionary
     }

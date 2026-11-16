@@ -22,9 +22,10 @@ public enum Chat {
         // Records an opening reasoning delimiter supplied by the generation prompt.
         package var prefilledReasoningStartDelimiter: String? = nil
 
-        // Finished reasoning that was streamed apart from `content`, kept for
-        // templates that replay it.
-        package var reasoning: String? = nil
+        /// Finished reasoning the assistant produced apart from `content`. Message
+        /// generators pass it to the chat template as `reasoning_content`, for templates
+        /// that replay it.
+        public var reasoning: String? = nil
 
         /// Array of image data associated with the message.
         public var images: [UserInput.Image]
@@ -94,11 +95,14 @@ public enum Chat {
             _ content: String,
             images: [UserInput.Image] = [],
             videos: [UserInput.Video] = [],
-            toolCalls: [ToolCall]? = nil
+            toolCalls: [ToolCall]? = nil,
+            reasoning: String? = nil
         ) -> Self {
-            Self(
+            var message = Self(
                 role: .assistant, content: content, images: images, videos: videos,
                 tool: toolCalls.map { .calls($0) })
+            message.reasoning = reasoning
+            return message
         }
 
         public static func user(
