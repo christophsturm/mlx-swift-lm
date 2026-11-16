@@ -279,6 +279,55 @@ struct MuseGlimmerDFlashGenerationTests {
         let pending = try #require(session.mainState?[mtpLastHiddenStatesKey]).dim(1)
         #expect(consumed + pending == session.processedTokenCount)
     }
+
+    /// A finished turn is checkpointed with the functions an app persists sessions with, and
+    /// the next turn, chunked and longer than the assistant's window, continues from the file
+    /// exactly as it continues in memory.
+    @Test("A saved and reloaded Muse speculative session continues like the uninterrupted one")
+    func reloadedSessionContinuesLikeTheUninterruptedOne() throws {
+        let (target, drafter) = try seededMuseDFlashPair()
+        var parameters = GenerateParameters(maxTokens: 9, temperature: 0)
+        parameters.prefill = PrefillParameters(stepSize: 8)
+        let firstPrompt = MLXArray([Int32(3), 17, 42, 5, 29, 11])
+        let suffix = MLXArray((0 ..< 12).map { Int32(($0 * 5 + 2) % 60) })
+
+        func turn(_ prompt: MLXArray, in session: MTPSpeculativeSessionState) throws
+            -> (tokens: [Int], proposed: Int, accepted: Int)
+        {
+            var iterator = try MTPSpeculativeTokenIterator(
+                input: LMInput(tokens: prompt), mainModel: target, drafter: drafter,
+                sessionState: session, parameters: parameters, blockSize: 4)
+            var tokens = [Int]()
+            while let token = iterator.next() { tokens.append(token) }
+            iterator.finalizeGeneration()
+            return (tokens, iterator.proposedCount, iterator.acceptedCount)
+        }
+
+        let uninterrupted = try MTPSpeculativeSessionState(
+            mainModel: target, drafter: drafter, parameters: parameters)
+        let checkpointed = try MTPSpeculativeSessionState(
+            mainModel: target, drafter: drafter, parameters: parameters)
+        let first = try turn(firstPrompt, in: uninterrupted)
+        #expect(try turn(firstPrompt, in: checkpointed) == first)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("muse-session-\(UUID().uuidString).safetensors")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try saveSpeculativePromptCache(url: url, sessionState: checkpointed)
+        let restored = try loadSpeculativePromptCacheSnapshot(
+            url: url, mainModel: target, drafter: drafter, parameters: parameters
+        ).sessionState
+
+        let second = try turn(suffix, in: uninterrupted)
+        let resumed = try turn(suffix, in: restored)
+        #expect(second.proposed > 0)
+        #expect(resumed == second)
+        #expect(restored.processedTokenCount == uninterrupted.processedTokenCount)
+        #expect(restored.tokenHistory == uninterrupted.tokenHistory)
+        #expect(
+            restored.drafterState?.cache.map(\.offset)
+                == uninterrupted.drafterState?.cache.map(\.offset))
+    }
 }
 
 /// Collects the positions a chunked prefill reports.

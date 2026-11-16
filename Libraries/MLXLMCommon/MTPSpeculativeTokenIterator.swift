@@ -572,6 +572,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 recordLogProbabilities(of: [token], sampledFrom: [logits])
             }
         }
+        // The window was a request for this prefill. Targets that copy the request into their
+        // output state must not leave it in the session state, which checkpoints persist.
+        mainState?[mtpTargetHiddenWindowKey] = nil
 
         sessionState.recordCommittedTokens(
             appendedInputTokens + additionallyCommittedTokens)
