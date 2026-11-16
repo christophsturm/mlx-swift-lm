@@ -39,6 +39,7 @@ public struct ATEMToolCallParser: ToolCallParser, Sendable {
         else { return nil }
 
         var arguments: [String: any Sendable] = [:]
+        var orderedArguments: [(name: String, value: any Sendable)] = []
         var remaining = invoke.body[...]
         while let start = structuralTag(Self.parameterPrefix, in: remaining) {
             // Non-whitespace outside parameter elements is malformed protocol.
@@ -60,6 +61,7 @@ public struct ATEMToolCallParser: ToolCallParser, Sendable {
             if schema.rejectsUnknownParameters, parameterSchema == nil { return nil }
             guard let value = parsedValue(rawValue, schema: parameterSchema) else { return nil }
             arguments[name] = value
+            orderedArguments.append((name, value))
             remaining = remaining[close.upperBound...]
         }
 
@@ -67,7 +69,7 @@ public struct ATEMToolCallParser: ToolCallParser, Sendable {
             schema.required.isSubset(of: Set(arguments.keys))
         else { return nil }
 
-        return ToolCall(function: .init(name: functionName, arguments: arguments))
+        return ToolCall(function: .init(name: functionName, orderedArguments: orderedArguments))
     }
 
     public func parseEOS(

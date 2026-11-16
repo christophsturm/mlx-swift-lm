@@ -181,9 +181,15 @@ extension MessageGenerator {
     }
 
     /// Adds tool-call metadata from a structured message to a raw message dictionary.
+    ///
+    /// When a call knows the order its arguments were generated in, the message also lists
+    /// every call's argument names under ``ToolCall/argumentOrderKey``.
     public func addToolMetadata(to dictionary: inout Message, for message: Chat.Message) {
         switch message.tool?.storage {
         case .calls(let calls):
+            if calls.contains(where: { $0.function.generatedArguments != nil }) {
+                dictionary[ToolCall.argumentOrderKey] = calls.map(\.function.argumentNames)
+            }
             dictionary["tool_calls"] = calls.map { toolCall -> [String: any Sendable] in
                 var entry: [String: any Sendable] = [
                     "type": "function",

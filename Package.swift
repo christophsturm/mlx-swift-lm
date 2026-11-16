@@ -69,6 +69,9 @@ let package = Package(
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "602.0.0" ..< "604.0.0"),
+        // Tests only: renders published chat templates with the Jinja engine, at the version
+        // the Hugging Face tokenizer bridge (swift-transformers 1.3) resolves.
+        .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.5"),
     ],
     targets: [
         .target(
@@ -178,12 +181,16 @@ let package = Package(
                 "MLXEmbedders",
                 "MLXRerankers",
                 "MLXScriptedLM",
+                .product(name: "Jinja", package: "swift-jinja"),
             ],
             path: "Tests/MLXLMTests",
             exclude: [
                 "README.md"
             ],
-            resources: [.process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov")]
+            resources: [
+                .process("Resources/1080p_30.mov"), .process("Resources/audio_only.mov"),
+                .copy("Resources/ChatTemplates"),
+            ]
         ),
         .macro(
             name: "MLXHuggingFaceMacros",
