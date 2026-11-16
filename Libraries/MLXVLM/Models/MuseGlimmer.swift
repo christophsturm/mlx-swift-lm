@@ -552,11 +552,18 @@ private class MuseGlimmerTextModel: Module {
         super.init()
     }
 
+    /// Returns the final-norm hidden states and the residual after each layer in
+    /// `captureLayerIDs`, in the order requested.
     func callAsFunction(
         _ inputs: MLXArray?,
         cache: [KVCache?]? = nil,
-        inputEmbedding: MLXArray? = nil
-    ) -> MLXArray {
+        inputEmbedding: MLXArray? = nil,
+        captureLayerIDs: [Int] = []
+    ) -> (hidden: MLXArray, captured: [MLXArray]) {
+        precondition(
+            Set(captureLayerIDs).count == captureLayerIDs.count
+                && captureLayerIDs.allSatisfy { layers.indices.contains($0) },
+            "Muse Glimmer capture layers must be unique and in range")
         var h: MLXArray
         if let inputEmbedding {
             h = inputEmbedding
@@ -577,10 +584,14 @@ private class MuseGlimmerTextModel: Module {
                 windowSize: config.slidingWindow)
         }
 
+        var captured = [Int: MLXArray]()
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: layer.isSliding ? slidingMask : fullMask, cache: layerCache[i])
+            if captureLayerIDs.contains(i) {
+                captured[i] = h
+            }
         }
-        return norm(h)
+        return (norm(h), captureLayerIDs.map { captured[$0]! })
     }
 }
 
@@ -610,20 +621,36 @@ private class MuseGlimmerLanguageModel: Module, KVCacheDimensionProvider {
         }
     }
 
+    /// When `state` asks for drafter state, the output state carries the residuals of the
+    /// layers in ``mtpTargetLayerIdsKey`` concatenated along the feature axis.
     func callAsFunction(
         _ inputs: MLXArray? = nil,
         cache: [KVCache]? = nil,
-        inputEmbedding: MLXArray? = nil
+        inputEmbedding: MLXArray? = nil,
+        state: LMOutput.State? = nil
     ) -> LMOutput {
+        let emitDrafterState = state?[mtpEmitFlagKey] ?? false
+        let captureLayerIDs = emitDrafterState ? (state?[mtpTargetLayerIdsKey] ?? []) : []
         let optionalCache = cache?.map { $0 as KVCache? }
-        let out = model(inputs, cache: optionalCache, inputEmbedding: inputEmbedding)
+        let (out, captured) = model(
+            inputs, cache: optionalCache, inputEmbedding: inputEmbedding,
+            captureLayerIDs: captureLayerIDs)
 
         var logits = lmHead(out) * config.outputMultiplier
         let cap = config.finalLogitSoftcapping
         if cap > 0 {
             logits = tanh(logits / cap) * cap
         }
-        return LMOutput(logits: logits)
+        guard emitDrafterState else { return LMOutput(logits: logits) }
+
+        var outputState = state ?? LMOutput.State()
+        outputState[mtpLastHiddenStatesKey] =
+            captured.isEmpty ? out : concatenated(captured, axis: -1)
+        // DFlash drafters read hidden features only; the shared K/V maps stay empty.
+        outputState[mtpSharedKVStatesKey] = [:]
+        outputState[mtpSharedKVOffsetsKey] = [:]
+        outputState[mtpSharedKVSourceIndicesKey] = [:]
+        return LMOutput(logits: logits, state: outputState)
     }
 }
 
@@ -1252,6 +1279,13 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         languageModel(inputs, cache: cache).logits
     }
 
+    /// Emits drafter state when `state` sets ``mtpEmitFlagKey``.
+    public func callAsFunction(
+        _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        languageModel(input.tokens, cache: cache, state: state)
+    }
+
     /// Key renaming only — a byte-for-byte port of `muse_glimmer.Model.sanitize`.
     ///
     /// The `mlx-community` repos are already published in the target layout, so
@@ -1273,6 +1307,22 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             result[key] = value
         }
         return result
+    }
+}
+
+extension MuseGlimmer: DFlashTargetModel {
+    public var dflashHiddenSize: Int { config.textConfiguration.hiddenSize }
+    public var dflashTargetLayerCount: Int { config.textConfiguration.hiddenLayers }
+    public var dflashVocabularySize: Int { config.textConfiguration.vocabularySize }
+
+    /// The raw lookup table: the assistant does not apply Muse's `embed_norm`.
+    public func dflashTokenEmbeddings(_ tokens: MLXArray) -> MLXArray {
+        languageModel.model.embedTokens(tokens)
+    }
+
+    /// The raw head: the assistant does not apply the output multiplier or the soft cap.
+    public func dflashLogits(_ hiddenStates: MLXArray) -> MLXArray {
+        languageModel.lmHead(hiddenStates)
     }
 }
 
