@@ -111,6 +111,36 @@ struct MuseGlimmerDFlashGenerationTests {
         #expect(speculative.acceptedCount > 0)
         #expect(speculative.acceptedCount < speculative.proposedCount)
     }
+
+    /// The vendor's sampler: temperature 1, top-p 0.95, top-k 64. Two tokens hold most of the
+    /// probability, so samples branch with the seed and the assistant is often right.
+    @Test("Sampled speculative output equals target-only output for the same seed")
+    func sampledSpeculationMatchesTargetOnly() throws {
+        let (target, drafter) = try seededMuseDFlashPair(vocabularySize: 16)
+        try concentrateHead(of: target)
+        let prompt = MLXArray([Int32(3), 7, 12, 5, 9, 11])
+        func sampling(seed: UInt64) -> GenerateParameters {
+            GenerateParameters(maxTokens: 24, temperature: 1, topP: 0.95, topK: 64, seed: seed)
+        }
+
+        let greedy = try targetOnlyTokens(
+            target, prompt: prompt, parameters: GenerateParameters(maxTokens: 24, temperature: 0))
+        let expected = try targetOnlyTokens(target, prompt: prompt, parameters: sampling(seed: 41))
+        let otherSeed = try targetOnlyTokens(
+            target, prompt: prompt, parameters: sampling(seed: 43))
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: target, drafter: drafter,
+            parameters: sampling(seed: 41), blockSize: 4)
+        var tokens = [Int]()
+        while let token = speculative.next() { tokens.append(token) }
+
+        #expect(expected != greedy)
+        #expect(expected != otherSeed)
+        #expect(tokens == expected)
+        #expect(speculative.passthroughReason == nil)
+        #expect(speculative.acceptedCount > 0)
+        #expect(speculative.acceptedCount < speculative.proposedCount)
+    }
 }
 
 /// Tokens a plain target-only iterator generates.

@@ -306,7 +306,7 @@ public final class MuseGlimmerAssistantDraftModel: Module, StatefulMTPDrafterMod
     public var maximumBlockSize: Int? { configuration.blockSize }
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
-    public let requiresGreedySampling = true
+    public let requiresGreedySampling = false
     public var targetLayerIds: [Int]? { configuration.targetLayerIDs }
     public let consumesTargetHiddenHistory = true
     /// The reference starts adaptive verification at four positions.

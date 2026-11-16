@@ -113,8 +113,9 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
     /// Log probabilities for the token returned by the most recent ``next()`` call.
     public private(set) var lastLogProbabilities: DeferredTokenLogProbabilities?
 
-    /// Sampler handed to ``MTPDrafterModel/draftBlock``: the base sampler,
-    /// wrapped to mask suppressed token IDs when the target has any.
+    /// Sampler handed to ``MTPDrafterModel/draftBlock``: a second instance of the
+    /// configured sampler with its own random stream, wrapped to mask suppressed
+    /// token IDs when the target has any.
     /// `draftBlock` receives no ``LogitProcessor``, and an unsuppressed
     /// draft of a suppressed token would always be rejected by the
     /// verifier, wasting draft slots.
@@ -322,11 +323,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         self.processor = components.logitProcessor(parameters: parameters, model: mainModel)
         // Draft proposals bypass the iterator's processor chain, so suppressed
         // ids have to be masked at the drafter's own sampler: a proposal the
-        // verifier will always reject is a wasted speculation slot.
+        // verifier will always reject is a wasted speculation slot. The drafter
+        // samples from its own random stream, so the verifier draws exactly the
+        // random numbers that target-only generation with the same seed draws.
+        let draftBaseSampler = parameters.sampler()
         if let suppressor = makeSuppressTokensProcessor(model: mainModel) {
-            self.draftSampler = SuppressTokensSampler(base: self.sampler, suppressor: suppressor)
+            self.draftSampler = SuppressTokensSampler(
+                base: draftBaseSampler, suppressor: suppressor)
         } else {
-            self.draftSampler = self.sampler
+            self.draftSampler = draftBaseSampler
         }
 
         self.maxTokens = parameters.maxTokens
