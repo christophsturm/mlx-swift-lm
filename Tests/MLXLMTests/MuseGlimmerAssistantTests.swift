@@ -126,7 +126,8 @@ struct MuseGlimmerAssistantTests {
                 _ = drafter.draftBlock(
                     target: target, lastToken: MLXArray([Int32(1)]),
                     lastHidden: rows[0..., range, 0...], sharedKV: [:], positionDeltas: nil,
-                    queryOffset: 0, blockSize: 4, state: &state, sampler: recorder)
+                    queryOffset: range.upperBound, blockSize: 4, state: &state,
+                    sampler: recorder)
             }
             let logits = recorder.logits.last!
             eval(logits)

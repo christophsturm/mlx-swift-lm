@@ -165,6 +165,114 @@ struct MuseGlimmerDFlashGenerationTests {
         #expect(iterator.tokenCount == 9)
         #expect(consumed + pending == session.processedTokenCount)
     }
+
+    /// The assistant attends only to the last `sliding_window` positions, so a long prompt
+    /// can prefill in chunks while the target keeps just those rows for it.
+    @Test("Prefill with the assistant runs in chunks and keeps only the assistant's window")
+    func chunkedPrefillKeepsTheAssistantWindow() throws {
+        let (target, drafter) = try seededMuseDFlashPair()
+        let prompt = MLXArray((0 ..< 40).map { Int32(($0 * 7 + 3) % 60) })
+        let progress = PrefillProgressLog()
+        var parameters = GenerateParameters(maxTokens: 12, temperature: 0)
+        parameters.prefill = PrefillParameters(
+            stepSize: 8, progress: { processed, _ in progress.record(processed) })
+
+        let expected = try targetOnlyTokens(target, prompt: prompt, parameters: parameters)
+        let targetOnlyChunks = progress.values
+        progress.clear()
+        let session = try MTPSpeculativeSessionState(
+            mainModel: target, drafter: drafter, parameters: parameters)
+        var iterator = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: target, drafter: drafter,
+            sessionState: session, parameters: parameters, blockSize: 4)
+        let promptHidden = try #require(session.mainState?[mtpLastHiddenStatesKey])
+        var tokens = [Int]()
+        while let token = iterator.next() { tokens.append(token) }
+        iterator.finalizeGeneration()
+
+        var unchunkedParameters = parameters
+        unchunkedParameters.prefill = PrefillParameters(chunking: .unchunked)
+        let unchunkedSession = try MTPSpeculativeSessionState(
+            mainModel: target, drafter: drafter, parameters: unchunkedParameters)
+        _ = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: target, drafter: drafter,
+            sessionState: unchunkedSession, parameters: unchunkedParameters, blockSize: 4)
+        let unchunkedHidden = try #require(unchunkedSession.mainState?[mtpLastHiddenStatesKey])
+        let window = drafter.configuration.slidingWindow
+
+        #expect(targetOnlyChunks.count > 2)
+        #expect(progress.values == targetOnlyChunks)
+        try #require(promptHidden.dim(1) == window)
+        #expect(
+            allClose(promptHidden, unchunkedHidden[0..., (-window)..., 0...], atol: 1e-4)
+                .item(Bool.self))
+        #expect(tokens == expected)
+        #expect(iterator.passthroughReason == nil)
+        #expect(iterator.proposedCount > 0)
+        let consumed = try #require(session.drafterState?.cache.first?.offset)
+        let pending = try #require(session.mainState?[mtpLastHiddenStatesKey]).dim(1)
+        #expect(consumed + pending == session.processedTokenCount)
+    }
+
+    /// An appended turn longer than the assistant's window skips the rows before it, so
+    /// the rows still pending from the previous turn no longer border the new ones.
+    @Test("A long appended turn prefills in chunks and keeps speculating")
+    func chunkedAppendKeepsSpeculating() throws {
+        let (target, drafter) = try seededMuseDFlashPair()
+        let progress = PrefillProgressLog()
+        var parameters = GenerateParameters(maxTokens: 6, temperature: 0)
+        parameters.prefill = PrefillParameters(
+            stepSize: 8, progress: { processed, _ in progress.record(processed) })
+        let session = try MTPSpeculativeSessionState(
+            mainModel: target, drafter: drafter, parameters: parameters)
+
+        let firstPrompt = [Int32(3), 17, 42, 5, 29, 11]
+        var first = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(firstPrompt)), mainModel: target, drafter: drafter,
+            sessionState: session, parameters: parameters, blockSize: 4)
+        var firstTokens = [Int32]()
+        while let token = first.next() { firstTokens.append(Int32(token)) }
+        first.finalizeGeneration()
+
+        let suffix = (0 ..< 30).map { Int32(($0 * 5 + 2) % 60) }
+        progress.clear()
+        var second = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: MLXArray(suffix)), mainModel: target, drafter: drafter,
+            sessionState: session, parameters: parameters, blockSize: 4)
+        let appendedRows = try #require(session.mainState?[mtpLastHiddenStatesKey]).dim(1)
+        var tokens = [Int]()
+        while let token = second.next() { tokens.append(token) }
+        second.finalizeGeneration()
+        let appendProgress = progress.values
+
+        let expected = try targetOnlyTokens(
+            target, prompt: MLXArray(firstPrompt + firstTokens + suffix), parameters: parameters)
+
+        #expect(appendProgress == [8, 16, 24, 29, 30])
+        #expect(appendedRows == drafter.configuration.slidingWindow)
+        #expect(tokens == expected)
+        #expect(second.passthroughReason == nil)
+        #expect(second.proposedCount > 0)
+        let consumed = try #require(session.drafterState?.cache.first?.offset)
+        let pending = try #require(session.mainState?[mtpLastHiddenStatesKey]).dim(1)
+        #expect(consumed + pending == session.processedTokenCount)
+    }
+}
+
+/// Collects the positions a chunked prefill reports.
+private final class PrefillProgressLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded = [Int]()
+
+    var values: [Int] { lock.withLock { recorded } }
+
+    func record(_ processed: Int) {
+        lock.withLock { recorded.append(processed) }
+    }
+
+    func clear() {
+        lock.withLock { recorded.removeAll() }
+    }
 }
 
 /// Tokens a plain target-only iterator generates.

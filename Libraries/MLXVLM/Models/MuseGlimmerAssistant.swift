@@ -171,16 +171,10 @@ private final class MuseGlimmerAssistantAttention: Module {
     /// Persists the new target context in `cache` and attends the proposal block over it.
     func callAsFunction(
         _ proposals: MLXArray,
-        context originalContext: MLXArray,
+        context: MLXArray,
         rope: RoPELayer,
         cache: RotatingKVCache
     ) -> MLXArray {
-        var context = originalContext
-        if context.dim(1) > slidingWindow {
-            let skipped = context.dim(1) - slidingWindow
-            context = context[0..., skipped..., 0...]
-            cache.offset += skipped
-        }
         let batchSize = proposals.dim(0)
         let proposalLength = proposals.dim(1)
         let contextLength = context.dim(1)
@@ -309,6 +303,9 @@ public final class MuseGlimmerAssistantDraftModel: Module, StatefulMTPDrafterMod
     public let requiresGreedySampling = false
     public var targetLayerIds: [Int]? { configuration.targetLayerIDs }
     public let consumesTargetHiddenHistory = true
+    /// Proposals attend to context at most `sliding_window` positions back. The Muse target,
+    /// the only one ``validateCompatibility(with:)`` accepts, honors the window in `prepare`.
+    public var targetHiddenWindow: Int? { configuration.slidingWindow }
     /// The reference starts adaptive verification at four positions.
     public let adaptiveBlockSizeInitial: Int? = 4
 
@@ -357,8 +354,15 @@ public final class MuseGlimmerAssistantDraftModel: Module, StatefulMTPDrafterMod
 
     /// One cache per layer holding the projected target context of the attention window.
     public func makeState(parameters _: GenerateParameters?) -> MTPDrafterState {
-        MTPDrafterState(
-            cache: layers.map { _ in RotatingKVCache(maxSize: configuration.slidingWindow) })
+        MTPDrafterState(cache: contextCaches(startingAt: 0))
+    }
+
+    private func contextCaches(startingAt position: Int) -> [KVCache] {
+        layers.map { _ in
+            let cache = RotatingKVCache(maxSize: configuration.slidingWindow)
+            cache.offset = position
+            return cache
+        }
     }
 
     /// Stateless entry point backed by a temporary stream state.
@@ -387,7 +391,7 @@ public final class MuseGlimmerAssistantDraftModel: Module, StatefulMTPDrafterMod
         lastHidden: MLXArray,
         sharedKV _: [String: (MLXArray, MLXArray)],
         positionDeltas _: MLXArray?,
-        queryOffset _: Int,
+        queryOffset: Int,
         blockSize: Int,
         state: inout MTPDrafterState,
         sampler: any LogitSampler
@@ -396,6 +400,22 @@ public final class MuseGlimmerAssistantDraftModel: Module, StatefulMTPDrafterMod
             preconditionFailure("MuseGlimmerAssistantDraftModel requires a DFlashTargetModel")
         }
         precondition(state.cache.count == layers.count)
+
+        // The rows end at the anchor, and no query reaches further back than the window.
+        let window = configuration.slidingWindow
+        let contextRows =
+            lastHidden.dim(1) > window ? lastHidden[0..., (-window)..., 0...] : lastHidden
+        let contextStart = queryOffset - contextRows.dim(1)
+        precondition(
+            contextStart >= state.nextPosition,
+            "Assistant context starting at \(contextStart) overlaps its cache ending at \(state.nextPosition)"
+        )
+        if contextStart > state.nextPosition {
+            // Rows are left out only before a full window of newer ones, so nothing cached
+            // lies within any later query's window. The context restarts at its first row.
+            state.cache = contextCaches(startingAt: contextStart)
+        }
+
         let batchSize = lastToken.size
         let anchor = lastToken.flattened().reshaped(batchSize, 1).asType(.int32)
         let masks = MLXArray.full(
@@ -404,14 +424,14 @@ public final class MuseGlimmerAssistantDraftModel: Module, StatefulMTPDrafterMod
             dtype: .int32)
 
         var hiddenStates = target.dflashTokenEmbeddings(concatenated([anchor, masks], axis: 1))
-        let context = encoder(lastHidden)
+        let context = encoder(contextRows)
         for (layer, cache) in zip(layers, state.cache) {
             guard let cache = cache as? RotatingKVCache else {
                 preconditionFailure("Muse Glimmer assistant layers use rotating caches")
             }
             hiddenStates = layer(hiddenStates, context: context, rope: rope, cache: cache)
         }
-        state.nextPosition += lastHidden.dim(1)
+        state.nextPosition = queryOffset
         state.proposalAppended = 0
 
         let logits = target.dflashLogits(norm(hiddenStates)[0..., 1..., 0...])

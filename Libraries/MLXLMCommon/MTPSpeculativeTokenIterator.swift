@@ -387,11 +387,15 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         let prefillStart = Date.timeIntervalSinceReferenceDate
         var mtpPrefill = parameters.prefill
-        if drafter.requiresPromptPrefill || continuationToResume != nil {
+        if (drafter.requiresPromptPrefill && drafter.targetHiddenWindow == nil)
+            || continuationToResume != nil
+        {
             // The target must expose one hidden row per prompt token so a
             // private MTP cache can be filled or resumed over the suffix.
             // Until model-specific chunk aggregation is available, use the
             // reference single-forward computation for this architecture.
+            // A drafter with a hidden-row window needs only the trailing rows,
+            // which a chunked prefill emits.
             mtpPrefill.stepSize = Int.max
             mtpPrefill.chunking = .unchunked
         }
@@ -449,6 +453,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         var prefillState = persistentState ?? LMOutput.State()
         prefillState[mtpEmitFlagKey] = true
         prefillState[mtpTargetLayerIdsKey] = drafter.targetLayerIds
+        prefillState[mtpTargetHiddenWindowKey] =
+            continuationToResume == nil ? drafter.targetHiddenWindow : nil
         // Stateful drafters and warm continuations need one hidden row per
         // prompt token, so their `prepare` call receives the emit flag. Other
         // drafters are primed by the explicit one-token follow-up below.
@@ -629,7 +635,7 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 let statefulDrafter = drafter as? any StatefulMTPDrafterModel,
                 var currentDrafterState = drafterState,
                 let targetHidden = mainState?[mtpLastHiddenStatesKey],
-                targetHidden.dim(1) >= promptLength
+                targetHidden.dim(1) >= requiredTargetHiddenRows(promptLength: promptLength)
             else {
                 switchToPassthrough(
                     reason:
@@ -656,13 +662,21 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
+    /// The prompt rows the target must emit: all of them, or the drafter's window of them.
+    private func requiredTargetHiddenRows(promptLength: Int) -> Int {
+        Swift.min(promptLength, drafter.targetHiddenWindow ?? promptLength)
+    }
+
     /// Initializes drafter state for a cold prompt or advances it across an appended suffix.
     private mutating func prepareAppendOnlyDrafterState(
         input: LMInput, promptLength: Int, isWarmAppend: Bool, previousTargetHidden: MLXArray?
     ) {
         let currentTargetHidden = mainState?[mtpLastHiddenStatesKey]
+        // Rows the target left out of this input separate the previous rows from its own.
+        let continuesPreviousRows =
+            isWarmAppend && (currentTargetHidden?.dim(1) ?? 0) >= promptLength
         let pendingTargetHidden: MLXArray?
-        if isWarmAppend, let previousTargetHidden, let currentTargetHidden {
+        if continuesPreviousRows, let previousTargetHidden, let currentTargetHidden {
             pendingTargetHidden = concatenated(
                 [previousTargetHidden, currentTargetHidden], axis: 1)
         } else {
@@ -677,8 +691,12 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             var currentDrafterState = drafterState,
             let targetHidden = pendingTargetHidden
         {
-            let previousHiddenLength = isWarmAppend ? previousTargetHidden?.dim(1) ?? 0 : 0
-            guard targetHidden.dim(1) >= promptLength + previousHiddenLength else {
+            let previousHiddenLength =
+                continuesPreviousRows ? previousTargetHidden?.dim(1) ?? 0 : 0
+            guard
+                targetHidden.dim(1)
+                    >= requiredTargetHiddenRows(promptLength: promptLength) + previousHiddenLength
+            else {
                 switchToPassthrough(
                     reason:
                         "target did not emit the complete uncached hidden suffix for drafter prefill"
@@ -1098,7 +1116,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
         let result = mainModel(y[text: .newAxis], cache: mainCache, state: stepState)
         mainState = result.state
         if let pendingHistory, let stepHidden = mainState?[mtpLastHiddenStatesKey] {
-            mainState?[mtpLastHiddenStatesKey] = concatenated([pendingHistory, stepHidden], axis: 1)
+            mainState?[mtpLastHiddenStatesKey] = concatenated(
+                [pendingHistory, stepHidden], axis: 1)
         }
         mainCacheStorage.commitProcessedTokens(y.cacheSequenceLength)
         sessionState.recordCommittedTokens(committedTokens)

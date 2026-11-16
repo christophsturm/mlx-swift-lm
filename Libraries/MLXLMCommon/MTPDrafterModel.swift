@@ -80,6 +80,16 @@ public protocol MTPDrafterModel: BaseLanguageModel {
     /// Whether each round consumes every newly verified target hidden row instead of one bonus row.
     var consumesTargetHiddenHistory: Bool { get }
 
+    /// How many of the latest target hidden rows the drafter can attend to, or `nil` when it
+    /// needs every row.
+    ///
+    /// A drafter that consumes hidden history and names a window lets the target prefill in
+    /// chunks: the prefill asks the target, through ``mtpTargetHiddenWindowKey``, for the rows
+    /// of only that many trailing positions. The rows of a round then end at its `queryOffset`
+    /// but may begin after positions whose rows were never emitted. Such a drafter must accept
+    /// only targets whose `prepare` honors the key.
+    var targetHiddenWindow: Int? { get }
+
     /// Initial verification width for acceptance-driven adaptation, or `nil` for a fixed width.
     var adaptiveBlockSizeInitial: Int? { get }
 
@@ -137,6 +147,7 @@ extension MTPDrafterModel {
     public var requiresGreedySampling: Bool { false }
     public var targetLayerIds: [Int]? { nil }
     public var consumesTargetHiddenHistory: Bool { false }
+    public var targetHiddenWindow: Int? { nil }
     public var adaptiveBlockSizeInitial: Int? { nil }
     public var adaptiveBlockSizeMinimum: Int { 4 }
 }
@@ -542,6 +553,13 @@ public let mtpEmitFlagKey = LMOutput.Key<Bool>("mtp.emitDrafterState")
 /// This is used by DFlash/DSpark-style drafters. An absent value preserves
 /// the target's ordinary MTP hidden-state behavior.
 public let mtpTargetLayerIdsKey = LMOutput.Key<[Int]>("mtp.targetLayerIds")
+
+/// How many trailing prompt positions a target's `prepare` emits in
+/// ``mtpLastHiddenStatesKey``, set from ``MTPDrafterModel/targetHiddenWindow``.
+///
+/// Rows before them are never emitted, so the prompt can prefill in chunks. An absent value
+/// asks for every prompt row.
+public let mtpTargetHiddenWindowKey = LMOutput.Key<Int>("mtp.targetHiddenWindow")
 
 /// Requests a recurrent-cache checkpoint after this many verification input
 /// tokens. Hybrid Qwen models use `1` for MTP-1 so a rejected draft restores

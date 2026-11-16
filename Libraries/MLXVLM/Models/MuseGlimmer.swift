@@ -622,12 +622,14 @@ private class MuseGlimmerLanguageModel: Module, KVCacheDimensionProvider {
     }
 
     /// When `state` asks for drafter state, the output state carries the residuals of the
-    /// layers in ``mtpTargetLayerIdsKey`` concatenated along the feature axis.
+    /// layers in ``mtpTargetLayerIdsKey`` concatenated along the feature axis, for the last
+    /// `emittedRows` positions when given and for every position otherwise.
     func callAsFunction(
         _ inputs: MLXArray? = nil,
         cache: [KVCache]? = nil,
         inputEmbedding: MLXArray? = nil,
-        state: LMOutput.State? = nil
+        state: LMOutput.State? = nil,
+        emittedRows: Int? = nil
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
         let captureLayerIDs = emitDrafterState ? (state?[mtpTargetLayerIdsKey] ?? []) : []
@@ -643,9 +645,14 @@ private class MuseGlimmerLanguageModel: Module, KVCacheDimensionProvider {
         }
         guard emitDrafterState else { return LMOutput(logits: logits) }
 
+        // Each layer is cut before concatenating, so no full-length copy outlives the forward.
+        func emitted(_ hidden: MLXArray) -> MLXArray {
+            guard let emittedRows, emittedRows < hidden.dim(1) else { return hidden }
+            return hidden[0..., (hidden.dim(1) - emittedRows)..., 0...]
+        }
         var outputState = state ?? LMOutput.State()
         outputState[mtpLastHiddenStatesKey] =
-            captured.isEmpty ? out : concatenated(captured, axis: -1)
+            captured.isEmpty ? emitted(out) : concatenated(captured.map(emitted), axis: -1)
         // DFlash drafters read hidden features only; the shared K/V maps stay empty.
         outputState[mtpSharedKVStatesKey] = [:]
         outputState[mtpSharedKVOffsetsKey] = [:]
@@ -1263,17 +1270,37 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         // full mask from the per-layer caches, which a single `.causal` mode
         // could not express.
         let totalPositions = embeddings.dim(1)
+        // Drafter rows cover the trailing positions the drafter reads, or the whole prompt
+        // when it names no window. Every forward that reaches them emits its share.
+        let emitsDrafterState = state?[mtpEmitFlagKey] ?? false
+        let firstEmittedPosition = max(
+            0, totalPositions - (state?[mtpTargetHiddenWindowKey] ?? totalPositions))
+        func emittedRows(_ range: Range<Int>) -> Int {
+            max(0, range.upperBound - max(range.lowerBound, firstEmittedPosition))
+        }
+        var chunkHidden = [MLXArray]()
         let processed = try prefill.forEachChunk(total: totalPositions) { range in
-            _ = languageModel(
-                nil, cache: convertedCache, inputEmbedding: embeddings[0..., range, 0...])
-            asyncEval(cache)
+            let reachesWindow = emitsDrafterState && emittedRows(range) > 0
+            let output = languageModel(
+                nil, cache: convertedCache, inputEmbedding: embeddings[0..., range, 0...],
+                state: reachesWindow ? state : nil, emittedRows: emittedRows(range))
+            if reachesWindow, let hidden = output.state?[mtpLastHiddenStatesKey] {
+                chunkHidden.append(hidden)
+                asyncEval(cache, hidden)
+            } else {
+                asyncEval(cache)
+            }
         }
         if processed > 0 { eval(cache) }
-        // Drafter state covers this final pass; drafters that need every prompt row
-        // prefill unchunked.
-        let result = languageModel(
+        var result = languageModel(
             nil, cache: convertedCache, inputEmbedding: embeddings[0..., processed..., 0...],
-            state: state)
+            state: state, emittedRows: emittedRows(processed ..< totalPositions))
+        if !chunkHidden.isEmpty, var resultState = result.state,
+            let finalHidden = resultState[mtpLastHiddenStatesKey]
+        {
+            resultState[mtpLastHiddenStatesKey] = concatenated(chunkHidden + [finalHidden], axis: 1)
+            result = LMOutput(logits: result.logits, state: resultState)
+        }
         prefill.progress?(totalPositions, totalPositions)
         return .logits(result)
     }
