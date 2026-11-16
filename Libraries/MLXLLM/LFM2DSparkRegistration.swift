@@ -3,11 +3,18 @@
 import Foundation
 import MLXLMCommon
 
+/// The `architectures` entry that identifies a Liquid AI DSpark checkpoint.
+let lfm2DSparkArchitecture = "Lfm2DSparkDraftModel"
+
 /// Registers Liquid AI's `Lfm2DSparkDraftModel` checkpoints with the shared
 /// block-drafter factory.
 public enum LFM2DSparkRegistration {
     public static func register() async {
-        await MTPDrafterTypeRegistry.shared.registerModelType(
+        await register(into: MTPDrafterTypeRegistry.shared)
+    }
+
+    package static func register(into registry: ModelTypeRegistry<any MTPDrafterModel>) async {
+        await registry.registerModelType(
             "qwen3",
             matches: { data in
                 guard
@@ -15,7 +22,7 @@ public enum LFM2DSparkRegistration {
                         as? [String: Any],
                     let architectures = object["architectures"] as? [String]
                 else { return false }
-                return architectures.contains("Lfm2DSparkDraftModel")
+                return architectures.contains(lfm2DSparkArchitecture)
             },
             creator: { data in
                 let configuration = try JSONDecoder.json5().decode(
