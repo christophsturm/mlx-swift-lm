@@ -18,7 +18,7 @@ struct Qwen35VLMExactSpeculativeVerificationTests {
         let singletonCache = try model.newCache(parameters: nil)
         var initialState = LMOutput.State()
         initialState[mtpEmitFlagKey] = true
-        initialState[mtpTargetLayerCaptureIDsKey] = [0, 1]
+        initialState[mtpTargetLayerIdsKey] = [0, 1]
         let prompt = LMInput.Text(tokens: MLXArray([Int32(1), 2, 3, 4]).reshaped(1, 4))
         let blockPrompt = model(prompt, cache: blockCache, state: initialState)
         let singletonPrompt = model(prompt, cache: singletonCache, state: initialState)

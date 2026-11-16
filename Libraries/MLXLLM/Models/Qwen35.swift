@@ -20,37 +20,38 @@ private enum RopeParametersCodingKey: String, CodingKey {
 
 public struct Qwen35TextConfiguration: Codable, Sendable {
     var modelType: String = ""
-    var hiddenSize: Int = 4096
-    var hiddenLayers: Int = 32
-    var intermediateSize: Int = 14336
-    var attentionHeads: Int = 32
-    var kvHeads: Int = 8
-    var linearNumValueHeads: Int = 64
-    var linearNumKeyHeads: Int = 16
-    var linearKeyHeadDim: Int = 192
-    var linearValueHeadDim: Int = 128
-    var linearConvKernelDim: Int = 4
+    public internal(set) var hiddenSize: Int = 4096
+    public internal(set) var hiddenLayers: Int = 32
+    public internal(set) var intermediateSize: Int = 14336
+    public internal(set) var attentionHeads: Int = 32
+    public internal(set) var kvHeads: Int = 8
+    public internal(set) var linearNumValueHeads: Int = 64
+    public internal(set) var linearNumKeyHeads: Int = 16
+    public internal(set) var linearKeyHeadDim: Int = 192
+    public internal(set) var linearValueHeadDim: Int = 128
+    public internal(set) var linearConvKernelDim: Int = 4
     var rmsNormEps: Float = 1e-6
-    var vocabularySize: Int = 151_936
+    public internal(set) var vocabularySize: Int = 151_936
     var ropeTheta: Float = 100000.0
     var partialRotaryFactor: Float = 0.25
     var maxPositionEmbeddings: Int = 131072
     var tieWordEmbeddings: Bool = false
     var attentionBias: Bool = false
-    var headDim: Int?
+    public internal(set) var headDim: Int?
     var ropeScaling: [String: StringOrNumber]?
     var fullAttentionInterval: Int = 4
     var layerTypes: [String]?
-    var resolvedLayerTypes: [String] = []
-    var mtpNumHiddenLayers: Int = 0
+    /// The attention kind of each layer, `"linear_attention"` or `"full_attention"`.
+    public internal(set) var resolvedLayerTypes: [String] = []
+    public internal(set) var mtpNumHiddenLayers: Int = 0
     var mtpUseDedicatedEmbeddings: Bool = false
 
     // MoE fields
-    var numExperts: Int = 0
-    var numExpertsPerTok: Int = 0
+    public internal(set) var numExperts: Int = 0
+    public internal(set) var numExpertsPerTok: Int = 0
     var decoderSparseStep: Int = 1
-    var sharedExpertIntermediateSize: Int = 0
-    var moeIntermediateSize: Int = 0
+    public internal(set) var sharedExpertIntermediateSize: Int = 0
+    public internal(set) var moeIntermediateSize: Int = 0
     var normTopkProb: Bool = true
 
     enum CodingKeys: String, CodingKey {
@@ -1275,7 +1276,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
     public let kvHeads: [Int]
 
     public let model: Qwen35TextModelInner
-    let configuration: Qwen35TextConfiguration
+    /// The text model's geometry.
+    public let configuration: Qwen35TextConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -1316,7 +1318,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?, lastTokenOnly: Bool
     ) -> LMOutput {
         let emitDrafterState = state?[mtpEmitFlagKey] ?? false
-        let captureLayerIDs = state?[mtpTargetLayerCaptureIDsKey] ?? []
+        let captureLayerIDs = state?[mtpTargetLayerIdsKey] ?? []
         let hiddenStates: MLXArray
         var capturedHiddenStates = [MLXArray]()
         if emitDrafterState {
@@ -1447,7 +1449,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
     private func exactSpeculativeHiddenStates(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> (hiddenStates: MLXArray, state: LMOutput.State) {
-        let captureLayerIDs = state?[mtpTargetLayerCaptureIDsKey] ?? []
+        let captureLayerIDs = state?[mtpTargetLayerIdsKey] ?? []
         var capturedHiddenStates = [MLXArray]()
         let hidden = model.exactSpeculativeForward(
             input.tokens,
@@ -1490,6 +1492,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider,
                 _ = try linearAttn.prepareFusedInputProjection()
             }
         }
+    }
+
+    public var excludedCheckpointNamespaces: [String] {
+        Qwen35CheckpointPolicy.excludedTargetNamespaces
     }
 
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
@@ -1571,6 +1577,12 @@ extension Qwen35TextModel: LoRAModel {
     }
 }
 
+extension Qwen35TextModel: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Qwen35CheckpointPolicy.components
+    }
+}
+
 extension Qwen35TextModel: SpeculativeCacheRewindModel {
     public var maximumNativeTargetCacheRewind: Int { .max }
 }
@@ -1598,6 +1610,9 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
+
+    /// The text backbone's geometry.
+    public var configuration: Qwen35TextConfiguration { languageModel.configuration }
 
     public init(_ args: Qwen35Configuration) {
         let textModel = Qwen35TextModel(args.textConfig)
@@ -1630,6 +1645,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         try languageModel.prepare()
     }
 
+    public var excludedCheckpointNamespaces: [String] {
+        Qwen35CheckpointPolicy.excludedTargetNamespaces
+    }
+
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
         var checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
             checkpoint, layout: .wrappedText,
@@ -1650,6 +1669,12 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+extension Qwen35Model: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Qwen35CheckpointPolicy.components
     }
 }
 

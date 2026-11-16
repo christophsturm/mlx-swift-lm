@@ -248,12 +248,27 @@ public enum Qwen35Language {
     final class RotaryEmbedding {
         private let invFreq: MLXArray
         private let mropeIndices: MLXArray
+        let attentionScaling: Float
 
-        init(dim: Int, base: Float, mropeSection: [Int]) {
+        init(
+            dim: Int, base: Float, mropeSection: [Int],
+            ropeParameters: [String: StringOrNumber]? = nil, maxPositionEmbeddings: Int = 131_072
+        ) {
             let safeDim = max(1, dim)
             var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
             freq = freq / Float(safeDim)
-            self.invFreq = 1.0 / pow(MLXArray(base), freq)
+
+            let ropeType = ropeParameters?["type"] ?? ropeParameters?["rope_type"]
+            if let ropeParameters, case .string("yarn") = ropeType {
+                let yarn = Qwen35Language.yarnParameters(
+                    dim: safeDim, base: base, maxPositionEmbeddings: maxPositionEmbeddings,
+                    ropeParameters)
+                self.invFreq = MLXArray(yarn.invFreq)
+                self.attentionScaling = yarn.attentionFactor
+            } else {
+                self.invFreq = 1.0 / pow(MLXArray(base), freq)
+                self.attentionScaling = 1
+            }
 
             let sections = mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
             var indices = [Int32](repeating: 0, count: freq.dim(0))
@@ -285,8 +300,69 @@ public enum Qwen35Language {
             freqs = applyInterleavedMRope(freqs)
 
             let emb = concatenated([freqs, freqs], axis: -1)
-            return (cos(emb).asType(x.dtype), sin(emb).asType(x.dtype))
+            var cosEmb = cos(emb)
+            var sinEmb = sin(emb)
+            // YaRN scales only the rotary slice of q and k, as in HF.
+            if attentionScaling != 1 {
+                cosEmb = cosEmb * attentionScaling
+                sinEmb = sinEmb * attentionScaling
+            }
+            return (cosEmb.asType(x.dtype), sinEmb.asType(x.dtype))
         }
+    }
+
+    /// HF `_compute_yarn_parameters`: blended inverse frequencies and the attention factor.
+    static func yarnParameters(
+        dim: Int, base: Float, maxPositionEmbeddings: Int,
+        _ ropeParameters: [String: StringOrNumber]
+    ) -> (invFreq: [Float], attentionFactor: Float) {
+        let base = Double(base)
+        let factor = Double(ropeParameters["factor"]?.asFloat() ?? 1)
+        let originalMax = Double(
+            ropeParameters["original_max_position_embeddings"]?.asFloat()
+                ?? Float(maxPositionEmbeddings))
+        let betaFast = Double(ropeParameters["beta_fast"]?.asFloat() ?? 32)
+        let betaSlow = Double(ropeParameters["beta_slow"]?.asFloat() ?? 1)
+
+        func mscale(_ scale: Double, _ mscale: Double = 1) -> Double {
+            scale <= 1 ? 1 : 0.1 * mscale * Foundation.log(scale) + 1
+        }
+
+        let attentionFactor: Double
+        if let value = ropeParameters["attention_factor"]?.asFloat() {
+            attentionFactor = Double(value)
+        } else if let m = ropeParameters["mscale"]?.asFloat(),
+            let mAll = ropeParameters["mscale_all_dim"]?.asFloat(), m != 0, mAll != 0
+        {
+            attentionFactor = mscale(factor, Double(m)) / mscale(factor, Double(mAll))
+        } else {
+            attentionFactor = mscale(factor)
+        }
+
+        func correctionDim(_ rotations: Double) -> Double {
+            Double(dim) * Foundation.log(originalMax / (rotations * 2 * .pi))
+                / (2 * Foundation.log(base))
+        }
+        var low = correctionDim(betaFast)
+        var high = correctionDim(betaSlow)
+        if case .bool(false) = ropeParameters["truncate"] {
+            // HF keeps the fractional correction range when truncate is false.
+        } else {
+            low = low.rounded(.down)
+            high = high.rounded(.up)
+        }
+        low = max(low, 0)
+        high = min(high, Double(dim - 1))
+        if low == high { high += 0.001 }
+
+        let invFreq = (0 ..< dim / 2).map { i -> Float in
+            let posFreq = Foundation.pow(base, Double(2 * i) / Double(dim))
+            let ramp = min(max((Double(i) - low) / (high - low), 0), 1)
+            let extrapolation = 1 - ramp
+            return Float(
+                (1 / (factor * posFreq)) * (1 - extrapolation) + (1 / posFreq) * extrapolation)
+        }
+        return (invFreq, Float(attentionFactor))
     }
 
     static func applyMultimodalRotaryPosEmb(
@@ -381,7 +457,9 @@ public enum Qwen35Language {
             let mrope = args.ropeParameters?["mrope_section"]?.asInts() ?? [11, 11, 10]
             let rotaryDim = Int(Float(headDim) * args.partialRotaryFactor)
             self.rotaryEmbedding = RotaryEmbedding(
-                dim: rotaryDim, base: args.ropeTheta, mropeSection: mrope)
+                dim: rotaryDim, base: args.ropeTheta, mropeSection: mrope,
+                ropeParameters: args.ropeParameters,
+                maxPositionEmbeddings: args.maxPositionEmbeddings)
             super.init()
         }
 
@@ -438,30 +516,24 @@ public enum Qwen35Language {
             var queries = initialQueries
             var keys = initialKeys
 
-            var kvSeqLen = keys.dim(-2)
             var positionIds = providedPositionIds
 
             if positionIds == nil {
                 let offset = cache?.offset ?? 0
-                kvSeqLen += offset + 1
                 var base = MLXArray(stride(from: offset, to: offset + L, by: 1)).asType(.int32)
                 base = tiled(base[.newAxis, 0...], repetitions: [B, 1])
                 positionIds = base[.newAxis, 0..., 0...]
                 positionIds = tiled(positionIds!, repetitions: [3, 1, 1])
-            } else if let cache {
-                kvSeqLen += cache.offset + 1
             }
 
             let (cosValues, sinValues) = rotaryEmbedding(x: values, positionIds: positionIds!)
             (queries, keys) = applyMultimodalRotaryPosEmb(
                 q: queries, k: keys, cos: cosValues, sin: sinValues)
 
-            let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode
-            if let mask {
-                attentionMask = .array(mask[.ellipsis, 0 ..< kvSeqLen])
-            } else {
-                attentionMask = .none
-            }
+            // The mask is sized for the keys the cache presents; slicing it to
+            // an offset-derived length would misalign it after eviction.
+            let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode =
+                mask.map { .array($0) } ?? .none
 
             return attentionWithCacheUpdate(
                 queries: queries,
@@ -1681,7 +1753,7 @@ public enum Qwen35Language {
             let positionIds = resolved.positionIds
 
             let emitDrafterState = state[mtpEmitFlagKey] ?? false
-            let captureLayerIDs = state[mtpTargetLayerCaptureIDsKey] ?? []
+            let captureLayerIDs = state[mtpTargetLayerIdsKey] ?? []
             var capturedHiddenStates = [MLXArray]()
             let preNormHidden = model.forward(
                 inputs,
@@ -1842,7 +1914,7 @@ public enum Qwen35Language {
                 imageGridTHW: nil,
                 videoGridTHW: nil)
             var state = resolved.state
-            let captureLayerIDs = state[mtpTargetLayerCaptureIDsKey] ?? []
+            let captureLayerIDs = state[mtpTargetLayerIdsKey] ?? []
             var capturedHiddenStates = [MLXArray]()
             let hidden = model.exactSpeculativeForward(
                 resolved.inputs,
@@ -2105,7 +2177,7 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
         {
             return try prepareContinuation(
                 input, inputIds: inputIds2D, cache: cache, cacheOffset: cacheOffset,
-                positionOffset: positionOffset, prefill: prefill)
+                positionOffset: positionOffset, state: state, prefill: prefill)
         }
 
         let (pixelValues, imageFrames, videoFrames, inputEmbeddings) =
@@ -2159,13 +2231,17 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
     /// image-free prefix). The returned state carries the rope delta the
     /// post-image text tail resumes with (`getRopeIndex` delta − `P`), so a
     /// caller threading state end-to-end continues that tail with the ordinary
-    /// flat-continuation branch. Decode stays caller-owned.
+    /// flat-continuation branch. When the caller requests MTP state, each
+    /// chunk's target hidden rows are retained and joined while the final
+    /// chunk supplies the cache metadata, so a warm drafter can resume over
+    /// the complete remainder. Decode stays caller-owned.
     private func prepareContinuation(
         _ input: LMInput,
         inputIds: MLXArray,
         cache: [any KVCache],
         cacheOffset: Int,
         positionOffset: Int,
+        state: LMOutput.State?,
         prefill: PrefillParameters
     ) throws -> PrepareResult {
         let remainderLength = inputIds.dim(-1)
@@ -2200,14 +2276,16 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
         // un-evaluated graph while letting the GPU run window i as the CPU
         // builds window i+1 (same shape as the sibling chunked prefills).
         let typedCache = castCache(cache)
+        let emitDrafterState = state?[mtpEmitFlagKey] ?? false
+        var emittedHiddenStates: [MLXArray] = []
 
         /// One forward over `range`, slicing positions and embeddings in lockstep.
         func forward(_ range: Range<Int>) -> LMOutput {
-            languageModel(
+            let output = languageModel(
                 inputIds[0..., range],
                 inputsEmbeds: inputEmbeddings.map { $0[0..., range, 0...] },
                 cache: typedCache,
-                state: nil,
+                state: state,
                 mask: nil,
                 positionIds: positionIds[0..., 0..., range],
                 // Never the pixels: a non-nil value here clears the carried
@@ -2216,6 +2294,10 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
                 imageGridTHW: nil,
                 videoGridTHW: nil
             )
+            if emitDrafterState, let hidden = output.state?[mtpLastHiddenStatesKey] {
+                emittedHiddenStates.append(hidden)
+            }
+            return output
         }
 
         let processed = try prefill.forEachChunk(total: remainderLength) { range in
@@ -2228,7 +2310,7 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
             eval(typedCache)
         }
 
-        let lastLogits = forward(processed ..< remainderLength).logits
+        let lastOutput = forward(processed ..< remainderLength)
         prefill.progress?(remainderLength, remainderLength)
 
         // Seed the post-image text tail's anchor. The vendor's flat-continuation
@@ -2236,11 +2318,19 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
         // after this remainder `tailCacheOffset = P + remainderLength`, so the
         // delta the tail needs is the offset-frame `getRopeIndex` delta minus
         // `P` (which `getRopeIndex` implicitly counted into `remainderLength`).
-        return .logits(
-            LMOutput(
-                logits: lastLogits,
-                state: QwenVL.continuationResumeState(
-                    ropeDeltas: ropeDeltas, cacheOffset: cacheOffset, key: ropeDeltasKey)))
+        let resumeDelta = ropeDeltas - MLXArray(Int32(cacheOffset))
+        var resumeState = lastOutput.state ?? state ?? LMOutput.State()
+        resumeState[precomputedPositionIdsKey] = nil
+        resumeState[ropeDeltasKey] = resumeDelta
+        if emitDrafterState, !emittedHiddenStates.isEmpty {
+            resumeState[mtpLastHiddenStatesKey] =
+                emittedHiddenStates.count == 1
+                ? emittedHiddenStates[0]
+                : concatenated(emittedHiddenStates, axis: 1)
+            resumeState[mtpPositionDeltasKey] = resumeDelta
+        }
+
+        return .logits(LMOutput(logits: lastOutput.logits, state: resumeState))
     }
 
     public func callAsFunction(
@@ -2297,6 +2387,10 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
         return languageModel.fusedGreedyDecode(
             input.tokens, cache: castCacheOptional(cache), state: state,
             tokenMask: tokenMask)
+    }
+
+    public var excludedCheckpointNamespaces: [String] {
+        Qwen35CheckpointPolicy.excludedTargetNamespaces
     }
 
     public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
@@ -2373,14 +2467,7 @@ public class Qwen35: Module, VLMModel, ExactSpeculativeVerificationModel,
 
 extension Qwen35: ModelComponentsProviding {
     public var modelComponents: [ModelComponent: [CheckpointComponent]] {
-        [
-            .vision: [
-                CheckpointComponent(
-                    name: "vision_tower",
-                    namespaces: ["vision_tower", "model.visual", "visual"],
-                    destination: "vision_tower")
-            ]
-        ]
+        Qwen35CheckpointPolicy.components
     }
 
     public var onDemandComponents: [AnyOnDemandComponent] { [onDemandVision] }

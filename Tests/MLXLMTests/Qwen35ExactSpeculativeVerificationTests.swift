@@ -97,7 +97,7 @@ struct Qwen35ExactSpeculativeVerificationTests {
         let verifyTokens = MLXArray([Int32(5), 6, 7, 8]).reshaped(1, 4)
         var state = LMOutput.State()
         state[mtpEmitFlagKey] = true
-        state[mtpTargetLayerCaptureIDsKey] = [0, 1]
+        state[mtpTargetLayerIdsKey] = [0, 1]
         state[mtpCacheCheckpointIndexKey] = 1
         let block = model.verifySpeculativeBlock(
             LMInput.Text(tokens: verifyTokens), cache: blockCache, state: state)

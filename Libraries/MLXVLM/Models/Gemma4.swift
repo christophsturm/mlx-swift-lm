@@ -1441,6 +1441,19 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Suppresse
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.model.layers }
 
+    /// Final-norm hidden states of the text decoder for `input`, `(B, L, hiddenSize)`: the
+    /// tensor the LM head consumes, built as `prepare` builds it, without the head or a cache.
+    @_spi(GemmaEncoder) public func hiddenStates(_ input: LMInput) throws -> MLXArray {
+        guard input.image != nil || input.video != nil || input.audio?.features != nil else {
+            return languageModel.model(input.text.tokens).hidden
+        }
+        let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
+        return languageModel.model(
+            nil, inputsEmbeds: inputsEmbeds, perLayerInputs: perLayerInputs,
+            tokenTypeIds: tokenTypeIds
+        ).hidden
+    }
+
     /// Multimodal placeholder token IDs that must never be sampled as text.
     /// Seeded from the model configuration; the model factory merges
     /// `suppress_tokens` from `generation_config.json` on top.
@@ -1502,6 +1515,23 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Suppresse
             return MLXArray.zeros([0, config.textConfiguration.hiddenSize], dtype: clips.dtype)
         }
         return concatenated(softTokens, axis: 0)
+    }
+
+    /// Embeddings, per-layer inputs and token types for a multimodal `input`, shared by
+    /// `prepare` and `hiddenStates(_:)`.
+    private func multimodalInputs(_ input: LMInput) throws -> (MLXArray, MLXArray?, MLXArray) {
+        let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
+            inputIds: input.text.tokens,
+            image: input.image,
+            video: input.video,
+            audioFeatures: input.audio?.features,
+            audioMask: input.audio?.mask)
+        let tokenTypeIds = gemma4TokenTypeIds(
+            inputIds: input.text.tokens,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            audioTokenId: config.audioTokenId)
+        return (inputsEmbeds, perLayerInputs, tokenTypeIds)
     }
 
     private func getInputEmbeddings(
@@ -1652,22 +1682,13 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, Suppresse
     {
         let convertedCache = cache.map { $0 }
         if input.image != nil || input.video != nil || input.audio?.features != nil {
-            let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
-                inputIds: input.text.tokens,
-                image: input.image,
-                video: input.video,
-                audioFeatures: input.audio?.features,
-                audioMask: input.audio?.mask)
+            let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
             let result = languageModel(
                 nil,
                 cache: convertedCache,
                 inputsEmbeds: inputsEmbeds,
                 perLayerInputs: perLayerInputs,
-                tokenTypeIds: gemma4TokenTypeIds(
-                    inputIds: input.text.tokens,
-                    imageTokenId: config.imageTokenId,
-                    videoTokenId: config.videoTokenId,
-                    audioTokenId: config.audioTokenId),
+                tokenTypeIds: tokenTypeIds,
                 lastLogitsOnly: true
             )
             let total = inputsEmbeds.dim(1)
@@ -1982,6 +2003,19 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider,
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.model.layers }
 
+    /// Final-norm hidden states of the text decoder for `input`, `(B, L, hiddenSize)`: the
+    /// tensor the LM head consumes, built as `prepare` builds it, without the head or a cache.
+    @_spi(GemmaEncoder) public func hiddenStates(_ input: LMInput) throws -> MLXArray {
+        guard input.image != nil || input.video != nil || input.audio != nil else {
+            return languageModel.model(input.text.tokens).hidden
+        }
+        let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
+        return languageModel.model(
+            nil, inputsEmbeds: inputsEmbeds, perLayerInputs: perLayerInputs,
+            tokenTypeIds: tokenTypeIds
+        ).hidden
+    }
+
     /// Multimodal placeholder token IDs that must never be sampled as text.
     /// Seeded from the model configuration; the model factory merges
     /// `suppress_tokens` from `generation_config.json` on top.
@@ -2076,6 +2110,27 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider,
         )
     }
 
+    /// Embeddings, per-layer inputs and token types for a multimodal `input`, shared by
+    /// `prepare` and `hiddenStates(_:)`.
+    private func multimodalInputs(_ input: LMInput) throws -> (MLXArray, MLXArray?, MLXArray) {
+        let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
+            inputIds: input.text.tokens,
+            pixelValues: input.image?.pixels,
+            imagePositionIds: input.image?.positionIds,
+            videoPixelValues: input.video?.pixels,
+            videoPositionIds: input.video?.positionIds,
+            audioFeatures: input.audio?.features,
+            audioMask: input.audio?.mask
+        )
+        let tokenTypeIds = gemma4TokenTypeIds(
+            inputIds: input.text.tokens,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            audioTokenId: config.audioTokenId
+        )
+        return (inputsEmbeds, perLayerInputs, tokenTypeIds)
+    }
+
     private func getInputEmbeddings(
         inputIds: MLXArray,
         pixelValues: MLXArray? = nil,
@@ -2161,21 +2216,7 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider,
                 input, cache: cache, prefill: prefill, languageModel: languageModel)
         }
 
-        let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
-            inputIds: input.text.tokens,
-            pixelValues: input.image?.pixels,
-            imagePositionIds: input.image?.positionIds,
-            videoPixelValues: input.video?.pixels,
-            videoPositionIds: input.video?.positionIds,
-            audioFeatures: input.audio?.features,
-            audioMask: input.audio?.mask
-        )
-        let tokenTypeIds = gemma4TokenTypeIds(
-            inputIds: input.text.tokens,
-            imageTokenId: config.imageTokenId,
-            videoTokenId: config.videoTokenId,
-            audioTokenId: config.audioTokenId
-        )
+        let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
         let result = languageModel(
             nil,
             cache: cache.map { $0 },
@@ -2231,6 +2272,20 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider,
     }
 }
 
+// MARK: - Checkpoint components
+
+extension Gemma4: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Gemma4Checkpoint.components
+    }
+}
+
+extension Gemma4Unified: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Gemma4Checkpoint.components
+    }
+}
+
 // MARK: - MTP drafter target access
 
 /// A Gemma 4 - family VLM whose text stack is the shared
@@ -2274,6 +2329,7 @@ public struct Gemma4MessageGenerator: MessageGenerator {
                     for: message, layout: .imagesThenVideosThenAudiosThenText),
             ]
         }
+        addReasoning(to: &dictionary, for: message)
         addToolMetadata(to: &dictionary, for: message)
         return dictionary
     }
@@ -3065,8 +3121,14 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
 
 extension Gemma4 {
     public var toolCallFormat: ToolCallFormat? { .gemma4 }
+
+    /// Gemma 4 brackets its thinking in labeled channels rather than a delimiter
+    /// pair (see `ReasoningConfig.gemma4`).
+    public var reasoningConfig: ReasoningConfig? { .gemma4 }
 }
 
 extension Gemma4Unified {
     public var toolCallFormat: ToolCallFormat? { .gemma4 }
+
+    public var reasoningConfig: ReasoningConfig? { .gemma4 }
 }

@@ -48,7 +48,7 @@ public final class MTPSpeculativeSessionState: @unchecked Sendable {
         parameters: GenerateParameters
     ) throws {
         precondition(processedTokenCount.map { $0 >= 0 } ?? true)
-        try drafter.requireCompatibility(with: mainModel)
+        try drafter.validateCompatibility(with: mainModel)
         let plan = try parameters.kvCachePlan()
         let cache = try plan.validated(
             mainCache ?? (try mainModel.newCache(parameters: parameters)))
@@ -69,6 +69,18 @@ public final class MTPSpeculativeSessionState: @unchecked Sendable {
         } else {
             self.tokenHistory = storage.processedTokenCount == 0 ? [] : nil
         }
+    }
+
+    /// Wraps cache storage owned by a `ChatSession`, which keeps its own token ledger.
+    package init(
+        adopting mainCacheStorage: KVCacheStorage,
+        mainState: LMOutput.State?,
+        drafterState: MTPDrafterState?
+    ) {
+        self.mainCacheStorage = mainCacheStorage
+        self.mainState = mainState
+        self.drafterState = drafterState
+        self.tokenHistory = nil
     }
 
     /// Records target inputs immediately after their cache timeline commits.
@@ -120,13 +132,13 @@ public func saveSpeculativePromptCache(
     }
     var mainState = sessionState.mainState
     let emitDrafterState = mainState?[mtpEmitFlagKey]
-    let targetLayerCaptureIDs = mainState?[mtpTargetLayerCaptureIDsKey]
+    let targetLayerCaptureIDs = mainState?[mtpTargetLayerIdsKey]
     let cacheCheckpointIndex = mainState?[mtpCacheCheckpointIndexKey]
     let sharedKV = mainState?[mtpSharedKVStatesKey] ?? [:]
     let sharedKVOffsets = mainState?[mtpSharedKVOffsetsKey]
     let sharedKVSourceIndices = mainState?[mtpSharedKVSourceIndicesKey]
     mainState?[mtpEmitFlagKey] = nil
-    mainState?[mtpTargetLayerCaptureIDsKey] = nil
+    mainState?[mtpTargetLayerIdsKey] = nil
     mainState?[mtpCacheCheckpointIndexKey] = nil
     mainState?[mtpSharedKVStatesKey] = nil
     mainState?[mtpSharedKVOffsetsKey] = nil
@@ -248,7 +260,7 @@ public func loadSpeculativePromptCacheSnapshot(
         mainState = LMOutput.State()
     }
     mainState?[mtpEmitFlagKey] = metadata.emitDrafterState
-    mainState?[mtpTargetLayerCaptureIDsKey] = metadata.targetLayerCaptureIDs
+    mainState?[mtpTargetLayerIdsKey] = metadata.targetLayerCaptureIDs
     mainState?[mtpCacheCheckpointIndexKey] = metadata.cacheCheckpointIndex
     mainState?[mtpSharedKVOffsetsKey] = metadata.sharedKVOffsets
     mainState?[mtpSharedKVSourceIndicesKey] = metadata.sharedKVSourceIndices

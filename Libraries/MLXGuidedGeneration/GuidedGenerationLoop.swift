@@ -7,8 +7,8 @@ import MLXLMCommon
 ///
 /// When the grammar forces deterministic tokens (e.g. JSON structural
 /// characters `{`, `}`, `,`, `:`), they're fed through the model one at
-/// a time to update the KV cache. Each pass uses the optimized T_q=1
-/// Metal kernel.
+/// a time to update the KV cache, after the sampled token that preceded
+/// them. Each pass uses the optimized T_q=1 Metal kernel.
 ///
 /// The loop overlaps grammar mask computation (CPU) with the model forward
 /// pass (GPU). After committing a token, the grammar state is ready for the
@@ -20,10 +20,7 @@ import MLXLMCommon
 /// KV cache.
 public enum GuidedGenerationLoop {
 
-    private static let logger = Logger(
-        subsystem: "com.apple.FoundationModels-MLX",
-        category: "GuidedGenerationLoop"
-    )
+    private static let logger = MLXLogger(label: "GuidedGenerationLoop")
 
     /// Result of a single generation step.
     enum StepResult {
@@ -404,16 +401,18 @@ public enum GuidedGenerationLoop {
                         for: mask, vocabSize: vocabSize, logitDim: logitDim)
                 }
 
-                // Process FF tokens one at a time to update KV cache.
+                // Feed the sampled token before its FF tokens, so later logits
+                // condition on the same tokens as the output.
                 // Batching (T_q > 1 with populated cache) triggers an MLX
                 // bug: scaledDotProductAttention in .causal mode creates a
                 // mask of shape (T_q, T_q) instead of (T_q, T_kv), causing
                 // a broadcast failure on models with global attention layers
                 // (e.g., Gemma 3). Single-token passes (T_q=1) use the
                 // optimized Metal kernel and skip the mask entirely.
-                for (i, ffToken) in ffTokens.enumerated() {
-                    let tokenInput = LMInput.Text(tokens: MLXArray([ffToken]))
-                    let isLast = i == ffTokens.count - 1
+                let fedTokens = [Int32(tokenId)] + ffTokens
+                for (i, fedToken) in fedTokens.enumerated() {
+                    let tokenInput = LMInput.Text(tokens: MLXArray([fedToken]))
+                    let isLast = i == fedTokens.count - 1
                     let fusedResult: FusedGreedyDecodeOutput? =
                         if isLast, canUseFusedGreedy {
                             fusedGreedyDecode(

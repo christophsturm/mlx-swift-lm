@@ -757,7 +757,7 @@ public final class Qwen3DFlashDraftModel: Module, StatefulMTPDrafterModel {
     public let requiresSharedTargetKV = false
     public let requiresPromptPrefill = true
     public let requiresGreedySampling = true
-    public var targetLayerCaptureIDs: [Int] { configuration.targetLayerIDs }
+    public var targetLayerIds: [Int]? { configuration.targetLayerIDs }
     public let consumesTargetHiddenHistory = true
     public var adaptiveBlockSizeInitial: Int? {
         configuration.blockSizePolicy == .adaptive ? configuration.initialBlockSize : nil
@@ -819,12 +819,8 @@ public final class Qwen3DFlashDraftModel: Module, StatefulMTPDrafterModel {
         super.init()
     }
 
-    public func isCompatible(with target: any LanguageModel) -> Bool {
-        (try? requireCompatibility(with: target)) != nil
-    }
-
     /// Verifies the target dimensions encoded in the standalone checkpoint.
-    public func requireCompatibility(with target: any LanguageModel) throws {
+    public func validateCompatibility(with target: any LanguageModel) throws {
         guard let target = target as? any DFlashTargetModel else {
             throw DFlashTargetCompatibilityError.unsupportedTarget(
                 String(describing: type(of: target)))

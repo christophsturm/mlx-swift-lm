@@ -162,7 +162,7 @@ struct Qwen3DFlashTests {
         let target = Qwen35TextModel(targetConfiguration)
         var state = drafter.makeState(parameters: nil)
 
-        try drafter.requireCompatibility(with: target)
+        try drafter.validateCompatibility(with: target)
         let tokens = drafter.draftBlock(
             target: target,
             lastToken: MLXArray([4]),
@@ -272,7 +272,7 @@ struct Qwen3DFlashTests {
         let model = Qwen35TextModel(configuration)
         var state = LMOutput.State()
         state[mtpEmitFlagKey] = true
-        state[mtpTargetLayerCaptureIDsKey] = [0, 2]
+        state[mtpTargetLayerIdsKey] = [0, 2]
 
         let tokens = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
         let output = model(LMInput.Text(tokens: tokens), cache: nil, state: state)
