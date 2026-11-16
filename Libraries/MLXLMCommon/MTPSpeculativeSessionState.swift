@@ -285,7 +285,8 @@ public func loadSpeculativePromptCacheSnapshot(
             drafterMetadata.hasSeedToken == (seedToken != nil),
             drafterMetadata.hasSeedHidden == (seedHidden != nil)
         else {
-            throw KVCacheError(message: "Speculative drafter state does not match the loaded companion")
+            throw KVCacheError(
+                message: "Speculative drafter state does not match the loaded companion")
         }
         let expectedState = statefulDrafter.makeState(parameters: parameters)
         guard expectedState.cache.count == restoredDrafterCache.count else {

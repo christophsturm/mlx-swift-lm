@@ -439,7 +439,8 @@ func testSpeculativePromptCacheRestoresTargetAndDrafterTogether() throws {
     #expect(restored.sessionState.tokenHistory == sessionState.tokenHistory)
     #expect(restored.sessionState.cache.count == sessionState.cache.count)
     #expect(restored.sessionState.cache.map(\.offset) == sessionState.cache.map(\.offset))
-    #expect(restored.sessionState.drafterState?.cache.count == sessionState.drafterState?.cache.count)
+    #expect(
+        restored.sessionState.drafterState?.cache.count == sessionState.drafterState?.cache.count)
     #expect(
         restored.sessionState.drafterState?.nextPosition
             == sessionState.drafterState?.nextPosition)
