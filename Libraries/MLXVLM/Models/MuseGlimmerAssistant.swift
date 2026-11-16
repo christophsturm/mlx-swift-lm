@@ -300,7 +300,7 @@ private final class MuseGlimmerAssistantContextProjection: Module {
 /// anchor, conditioned on target residuals it keeps in a sliding-window cache.
 ///
 /// It borrows the target's raw token embeddings and raw output head through
-/// ``DFlashTargetModel`` and retains nothing from the target.
+/// `DFlashTargetModel` and retains nothing from the target.
 public final class MuseGlimmerAssistantDraftModel: Module, StatefulMTPDrafterModel {
     public let configuration: MuseGlimmerAssistantConfiguration
     public var maximumBlockSize: Int? { configuration.blockSize }

@@ -1282,7 +1282,7 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
         languageModel(inputs, cache: cache).logits
     }
 
-    /// Emits drafter state when `state` sets ``mtpEmitFlagKey``.
+    /// Emits drafter state when `state` sets `mtpEmitFlagKey`.
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
