@@ -5,6 +5,7 @@ import MLXLMCommon
 import Testing
 
 @testable import MLXLLM
+@testable import MLXVLM
 
 @Suite("Speculative drafter registrations")
 struct MTPDrafterRegistrationTests {
@@ -19,6 +20,7 @@ struct MTPDrafterRegistrationTests {
         let registrations: [Registration] = [
             { await LFM2DSparkRegistration.register(into: $0) },
             { await Qwen3DFlashRegistration.register(into: [$0]) },
+            { await MuseGlimmerAssistantRegistration.register(into: $0) },
         ]
         let registry = ModelTypeRegistry<any MTPDrafterModel>()
         for registration in reversed ? registrations.reversed() : registrations {
@@ -29,9 +31,24 @@ struct MTPDrafterRegistrationTests {
             configuration: Data(lfm2DSparkJSON.utf8), modelType: "qwen3")
         let qwenDFlash = try await registry.createModel(
             configuration: Data(qwenDFlashJSON.utf8), modelType: "qwen3")
+        let museAssistant = try await registry.createModel(
+            configuration: Data(publishedAssistantConfigJSON.utf8),
+            modelType: "muse_glimmer_assistant")
 
         #expect(lfm2DSpark is LFM2DSparkDraftModel)
         #expect(qwenDFlash is Qwen3DFlashDraftModel)
+        #expect(museAssistant is MuseGlimmerAssistantDraftModel)
+    }
+
+    @Test("The Muse Glimmer assistant registers for vision-language targets")
+    func museAssistantRegistersForVisionLanguageTargets() async throws {
+        await MuseGlimmerAssistantRegistration.register()
+
+        let model = try await MTPDrafterTypeRegistry.visionLanguage.createModel(
+            configuration: Data(publishedAssistantConfigJSON.utf8),
+            modelType: "muse_glimmer_assistant")
+
+        #expect(model is MuseGlimmerAssistantDraftModel)
     }
 }
 

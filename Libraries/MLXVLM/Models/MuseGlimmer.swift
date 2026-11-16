@@ -1269,8 +1269,11 @@ public class MuseGlimmer: Module, VLMModel, KVCacheDimensionProvider {
             asyncEval(cache)
         }
         if processed > 0 { eval(cache) }
+        // Drafter state covers this final pass; drafters that need every prompt row
+        // prefill unchunked.
         let result = languageModel(
-            nil, cache: convertedCache, inputEmbedding: embeddings[0..., processed..., 0...])
+            nil, cache: convertedCache, inputEmbedding: embeddings[0..., processed..., 0...],
+            state: state)
         prefill.progress?(totalPositions, totalPositions)
         return .logits(result)
     }
