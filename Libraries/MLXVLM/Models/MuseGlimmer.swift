@@ -1571,26 +1571,28 @@ public struct MuseGlimmerProcessorConfiguration: Codable, Sendable {
 /// `factor` is `patch_size * merge_size` (28), so the grid is measured in *merged*
 /// tokens and `maxTokens` bounds the post-merge sequence length.
 ///
-/// The reference selects with `min()` over a Python `set`, whose iteration order
-/// makes ties non-deterministic. Candidates are sorted here so the choice is
-/// stable; ties are rare but would otherwise change the token count run to run.
+/// When the grids below and above the ideal one match the aspect ratio equally well, as for
+/// every square image whose side is not a multiple of 28, the reference keeps the first in
+/// the iteration order of a Python `set`. That order is fixed for integer tuples, and the
+/// token count depends on it: the reference feeds a 64 × 64 image as 3 × 3 merged tokens,
+/// and with 2 × 2 the 30B checkpoint reads a solid color as a blank image. Ties are broken
+/// here in the same order, with the reference's double-precision arithmetic.
 func museSmartResize(height: Int, width: Int, factor: Int, maxTokens: Int) -> (Int, Int) {
-    var idealH = Float(height) / Float(factor)
-    var idealW = Float(width) / Float(factor)
+    var idealH = Double(height) / Double(factor)
+    var idealW = Double(width) / Double(factor)
     let ratio = idealH > 0 ? idealW / idealH : 1.0
 
-    if idealH * idealW > Float(maxTokens) {
-        idealH = (Float(maxTokens) / ratio).squareRoot()
+    if idealH * idealW > Double(maxTokens) {
+        idealH = (Double(maxTokens) / ratio).squareRoot()
         idealW = idealH * ratio
     }
 
-    let hOptions = Set([Int(idealH.rounded(.down)), Int(idealH.rounded(.up))])
-    let wOptions = Set([Int(idealW.rounded(.down)), Int(idealW.rounded(.up))])
-    var candidates = [(Int, Int)]()
-    for h in hOptions.sorted() {
-        for w in wOptions.sorted() where h >= 1 && w >= 1 && h * w <= maxTokens {
-            candidates.append((h, w))
-        }
+    // `itertools.product` order, then the order the reference's `set` iterates them in.
+    let heights = [Int(idealH.rounded(.down)), Int(idealH.rounded(.up))]
+    let widths = [Int(idealW.rounded(.down)), Int(idealW.rounded(.up))]
+    let grids = heights.flatMap { h in widths.map { w in (h, w) } }
+    var candidates = pythonSetIterationOrder(grids).filter { h, w in
+        h >= 1 && w >= 1 && h * w <= maxTokens
     }
     if candidates.isEmpty {
         candidates = [
@@ -1601,12 +1603,50 @@ func museSmartResize(height: Int, width: Int, factor: Int, maxTokens: Int) -> (I
         ]
     }
 
-    let sourceRatio = Float(height) / Float(width)
+    // Like Python's `min`, this keeps the first of equally close grids.
+    let sourceRatio = Double(height) / Double(width)
     let best = candidates.min { lhs, rhs in
-        abs(Float(lhs.0) / Float(lhs.1) - sourceRatio)
-            < abs(Float(rhs.0) / Float(rhs.1) - sourceRatio)
+        abs(Double(lhs.0) / Double(lhs.1) - sourceRatio)
+            < abs(Double(rhs.0) / Double(rhs.1) - sourceRatio)
     }!
     return (best.0 * factor, best.1 * factor)
+}
+
+/// The order in which CPython iterates a `set` built from `items`, pairs of non-negative
+/// integers below 2^61, inserted in order; duplicates are dropped.
+///
+/// CPython hashes such integers to themselves and tuples with xxHash (since 3.8), and neither
+/// is randomized. A set of at most four entries lives in an eight-slot table, filled by
+/// CPython's perturbed probing and iterated in slot order.
+func pythonSetIterationOrder(_ items: [(Int, Int)]) -> [(Int, Int)] {
+    precondition(items.count <= 4, "An eight-slot set table holds at most four entries")
+    var table = [(Int, Int)?](repeating: nil, count: 8)
+    for item in items {
+        let hash = pythonTupleHash(item)
+        var slot = Int(hash & 7)
+        var perturb = hash
+        while let occupant = table[slot], occupant != item {
+            perturb >>= 5
+            slot = Int((UInt64(slot) &* 5 &+ 1 &+ perturb) & 7)
+        }
+        table[slot] = item
+    }
+    return table.compactMap { $0 }
+}
+
+/// CPython's `hash((first, second))` for non-negative integers below 2^61, as an unsigned word.
+private func pythonTupleHash(_ tuple: (Int, Int)) -> UInt64 {
+    let prime1: UInt64 = 11_400_714_785_074_694_791
+    let prime2: UInt64 = 14_029_467_366_897_019_727
+    let prime5: UInt64 = 2_870_177_450_012_600_261
+    var accumulator = prime5
+    for lane in [UInt64(tuple.0), UInt64(tuple.1)] {
+        accumulator = accumulator &+ lane &* prime2
+        accumulator = (accumulator << 31) | (accumulator >> 33)
+        accumulator = accumulator &* prime1
+    }
+    accumulator = accumulator &+ (2 ^ (prime5 ^ 3_527_539))
+    return accumulator == UInt64.max ? 1_546_275_796 : accumulator
 }
 
 public struct MuseGlimmerProcessor: UserInputProcessor {

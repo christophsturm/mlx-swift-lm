@@ -656,6 +656,23 @@ struct MuseGlimmerPreprocessingTests {
                 == (112, 56))
     }
 
+    /// When the grids below and above the ideal one fit the aspect ratio equally well, the
+    /// reference keeps whichever its Python `set` yields first, an order that is fixed for
+    /// integer tuples. Expected values are the reference `smart_resize` run under CPython 3.14.
+    @Test("smart resize breaks ties as the reference does")
+    func smartResizeTies() {
+        let cases: [(height: Int, width: Int, expected: (Int, Int))] = [
+            (64, 64, (84, 84)), (100, 100, (112, 112)), (150, 150, (168, 168)),
+            (300, 300, (280, 280)), (512, 512, (532, 532)), (1024, 1024, (1036, 1036)),
+            (34, 33, (28, 28)), (48, 46, (28, 28)),
+        ]
+        for (height, width, expected) in cases {
+            let resized = museSmartResize(
+                height: height, width: width, factor: 28, maxTokens: 4096)
+            #expect(resized == expected, "\(height) x \(width)")
+        }
+    }
+
     @Test("smart resize keeps the merged-token budget")
     func smartResizeBudget() {
         for (h, w) in [(4096, 4096), (8000, 200), (200, 8000), (3000, 2000)] {
@@ -981,6 +998,16 @@ struct MuseGlimmerImageBudgetTests {
             #expect(patches.dim(0) == frames.product)
             #expect(patches.dim(1) == 2 * 3 * 14 * 14)
         }
+    }
+
+    /// A 64 x 64 image ties between 2 x 2 and 3 x 3 merged tokens. The reference and llama.cpp
+    /// both feed 3 x 3; with 2 x 2 the 30B checkpoint reads a solid color as a blank image.
+    @Test("a 64 x 64 image gets the reference's 3 x 3 merged tokens")
+    func smallSquareImageGrid() throws {
+        let (patches, frames) = try Self.processor().preprocess(
+            image: Self.image(width: 64, height: 64), processing: nil)
+        #expect(frames.h == 6 && frames.w == 6)
+        #expect(patches.dim(0) == 36)
     }
 
     /// `maxPixels` is the model-agnostic per-call hook; one merged token covers
