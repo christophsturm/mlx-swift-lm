@@ -41,6 +41,24 @@ public class SampleTests: XCTestCase {
         }
     }
 
+    /// Block drafters sample `[batch, positions, vocabulary]` logits in one call; mlx-lm's
+    /// `apply_top_k` filters every position (`[..., top_k:]`).
+    func testTopKSamplerFiltersEveryPositionOfABlock() throws {
+        let sampler = TopPSampler(temperature: 1.0, topK: 1)
+        let logits = MLXArray(
+            [
+                0.1, 2.0, 1.0, 0.5,
+                0.0, 0.2, 0.3, 3.0,
+                4.0, 1.0, 2.0, 3.0,
+            ] as [Float], [1, 3, 4])
+
+        for _ in 0 ..< 10 {
+            let tokens = try withError { sampler.sample(logits: logits) }
+            XCTAssertEqual(tokens.shape, [1, 3])
+            XCTAssertEqual(tokens.asArray(Int.self), [1, 3, 0])
+        }
+    }
+
     func testTopPSamplerLowThresholdKeepsMaxToken() {
         let probs = MLXArray([0.9 as Float, 0.0 as Float, 0.0 as Float, 0.1 as Float])[
             .newAxis, .ellipsis]

@@ -142,6 +142,28 @@ struct MuseGlimmerDFlashGenerationTests {
         #expect(speculative.acceptedCount < speculative.proposedCount)
     }
 
+    /// The vendor's sampler over a vocabulary wider than its top-k, so top-k filters every
+    /// position of the block the assistant samples in one call.
+    @Test("Sampled speculation with top-k below the vocabulary equals target-only output")
+    func sampledSpeculationWithTopKBelowTheVocabulary() throws {
+        let (target, drafter) = try seededMuseDFlashPair(vocabularySize: 128)
+        try concentrateHead(of: target)
+        let prompt = MLXArray([Int32(3), 7, 12, 5, 9, 11])
+        let parameters = GenerateParameters(
+            maxTokens: 24, temperature: 1, topP: 0.95, topK: 64, seed: 41)
+
+        let expected = try targetOnlyTokens(target, prompt: prompt, parameters: parameters)
+        var speculative = try MTPSpeculativeTokenIterator(
+            input: LMInput(tokens: prompt), mainModel: target, drafter: drafter,
+            parameters: parameters, blockSize: 4)
+        var tokens = [Int]()
+        while let token = speculative.next() { tokens.append(token) }
+
+        #expect(tokens == expected)
+        #expect(speculative.passthroughReason == nil)
+        #expect(speculative.proposedCount > 0)
+    }
+
     /// Every committed target position hands its hidden row to the assistant once: the
     /// assistant's context cache holds it, or it waits for the next draft. With every
     /// proposal rejected, each round emits one token, so the last token of the budget comes
