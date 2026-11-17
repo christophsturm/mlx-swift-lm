@@ -132,6 +132,25 @@ struct ToolCallArgumentOrderTests {
                 == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
     }
 
+    @Test("A JSON call in a tool-call frame that recovery heals keeps its written order")
+    func recoveredJSONFrameKeepsTheWrittenOrder() throws {
+        let tools: [[String: any Sendable]] = [
+            ["function": ["name": "record_edit"] as [String: any Sendable]]
+        ]
+        let processor = ToolCallProcessor(format: .mistral, tools: tools)
+        let generated =
+            #"<tool_call>{"name": "record_edit", "arguments": {"target": "b.txt", "reason": "typo", "#
+            + #""action": "edit", "content": "B"}}</tool_call>"#
+
+        #expect(processor.processChunk(generated) == nil)
+        processor.processEOS()
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(
+            call.function.generatedArguments
+                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+    }
+
     @Test("A call restored from its generated arguments renders them in that order")
     func restoredCallRendersInGeneratedOrder() throws {
         let generatedArguments = #"{"b": "Lantern", "a": "Bring oil"}"#
