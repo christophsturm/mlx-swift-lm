@@ -59,6 +59,21 @@ public struct ToolCall: Hashable, Codable, Sendable {
             self.generatedArguments = jsonObjectText(names.map { ($0, arguments[$0]!) })
         }
 
+        /// A call whose arguments the model wrote as the JSON object `text`, which `arguments`
+        /// was decoded from, listing them in the order `text` does. When the keys of `text`
+        /// cannot be read in order, the order stays unknown.
+        package init(name: String, arguments: [String: any Sendable], writtenAs text: String) {
+            guard let names = jsonObjectKeys(text) else {
+                self.init(name: name, arguments: arguments)
+                return
+            }
+            self.init(
+                name: name,
+                orderedArguments: names.compactMap { argument in
+                    arguments[argument].map { (argument, $0) }
+                })
+        }
+
         var argumentsObject: [String: any Sendable] {
             arguments.mapValues { $0.sendableValue }
         }

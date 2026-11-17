@@ -87,6 +87,19 @@ struct ToolCallArgumentOrderTests {
                 == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
     }
 
+    @Test("Mistral keeps the order a call's arguments were written in")
+    func mistralKeepsTheWrittenOrder() throws {
+        let generated =
+            #"[TOOL_CALLS]record_edit[ARGS]{"target": "b.txt", "reason": "typo", "#
+            + #""action": "edit", "content": "B"}"#
+        let call = try #require(
+            ToolCallFormat.mistral.createParser().parse(content: generated, tools: nil))
+
+        #expect(
+            call.function.generatedArguments
+                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+    }
+
     @Test("A call restored from its generated arguments renders them in that order")
     func restoredCallRendersInGeneratedOrder() throws {
         let generatedArguments = #"{"b": "Lantern", "a": "Bring oil"}"#

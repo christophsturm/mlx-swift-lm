@@ -61,7 +61,7 @@ public struct MistralToolCallParser: ToolCallParser, Sendable {
         }
 
         return ToolCall(
-            function: ToolCall.Function(name: namePart, arguments: argsDict),
+            function: ToolCall.Function(name: namePart, arguments: argsDict, writtenAs: argsPart),
             id: callID
         )
     }
