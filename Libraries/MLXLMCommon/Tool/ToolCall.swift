@@ -60,18 +60,29 @@ public struct ToolCall: Hashable, Codable, Sendable {
         }
 
         /// A call whose arguments the model wrote as the JSON object `text`, which `arguments`
-        /// was decoded from, listing them in the order `text` does. When the keys of `text`
-        /// cannot be read in order, the order stays unknown.
+        /// was decoded from, listing them in the order `text` does. When `text` is not one JSON
+        /// object naming exactly the arguments, the order stays unknown.
         package init(name: String, arguments: [String: any Sendable], writtenAs text: String) {
-            guard let names = jsonObjectKeys(text) else {
-                self.init(name: name, arguments: arguments)
-                return
-            }
             self.init(
-                name: name,
-                orderedArguments: names.compactMap { argument in
-                    arguments[argument].map { (argument, $0) }
-                })
+                name: name, arguments: arguments.mapValues { JSONValue.from($0) }, writtenAs: text)
+        }
+
+        /// A call whose arguments the model wrote as the JSON object `text`, which `arguments`
+        /// was decoded from, listing them in the order `text` does. When `text` is not one JSON
+        /// object naming exactly the arguments, the order stays unknown. A repeated name keeps
+        /// its first position.
+        package init(name: String, arguments: [String: JSONValue], writtenAs text: String) {
+            self.name = name
+            self.arguments = arguments
+            let keys = jsonObjectKeys(text)
+            var names = [String]()
+            var seen = Set<String>()
+            for key in keys ?? [] where seen.insert(key).inserted {
+                names.append(key)
+            }
+            self.generatedArguments =
+                keys != nil && seen == Set(arguments.keys)
+                ? jsonObjectText(names.map { ($0, arguments[$0]!) }) : nil
         }
 
         var argumentsObject: [String: any Sendable] {
@@ -135,6 +146,12 @@ private func jsonObjectText(_ members: [(name: String, value: JSONValue)]) -> St
 /// The keys of one JSON object in the order its text lists them, or `nil` when `text` is not
 /// one JSON object.
 private func jsonObjectKeys(_ text: String) -> [String]? {
+    jsonObjectMembers(text[...])?.map(\.key)
+}
+
+/// The members of one JSON object in the order its text lists them, each value as the text it is
+/// written as, or `nil` when `text` is not one JSON object.
+func jsonObjectMembers(_ text: Substring) -> [(key: String, value: Substring)]? {
     let utf8 = text.utf8
     var index = utf8.startIndex
     func skipWhitespace() {
@@ -159,21 +176,21 @@ private func jsonObjectKeys(_ text: String) -> [String]? {
     }
 
     guard take("{") else { return nil }
-    var keys = [String]()
+    var members = [(key: String, value: Substring)]()
     if !take("}") {
         repeat {
             skipWhitespace()
             guard index < utf8.endIndex, utf8[index] == Character("\"").asciiValue,
                 let keyText = value(),
                 let key = try? JSONDecoder().decode(String.self, from: Data(keyText.utf8)),
-                take(":"), value() != nil
+                take(":"), let memberValue = value()
             else { return nil }
-            keys.append(key)
+            members.append((key, memberValue))
         } while take(",")
         guard take("}") else { return nil }
     }
     skipWhitespace()
-    return index == utf8.endIndex ? keys : nil
+    return index == utf8.endIndex ? members : nil
 }
 
 extension ToolCall {

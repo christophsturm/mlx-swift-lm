@@ -59,22 +59,28 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         return parseToolCall(from: split.object)
     }
 
+    /// Parses one call object, its arguments in the order the model wrote them.
+    ///
+    /// The object is decoded through `JSONSerialization`, which keeps no key order, so the
+    /// order comes from the arguments' own text: the `arguments` member as written, or the
+    /// JSON text a stringified `arguments` holds.
     private func parseToolCall(from text: String) -> ToolCall? {
-        guard let data = text.data(using: .utf8) else { return nil }
-        return parseToolCall(from: data)
-    }
-
-    private func parseToolCall(from data: Data) -> ToolCall? {
-        guard var jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let data = text.data(using: .utf8),
+            var jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
             return nil
         }
+        var members = jsonObjectMembers(text[...])
 
         var id = jsonObject["id"] as? String
         if let functionObject = jsonObject["function"] as? [String: Any] {
             id = id ?? functionObject["id"] as? String
             jsonObject = functionObject
+            members = members?.first { $0.key == "function" }.flatMap {
+                jsonObjectMembers($0.value)
+            }
         }
+        var argumentsText = members?.first { $0.key == "arguments" }.map { String($0.value) }
 
         if let stringifiedArguments = jsonObject["arguments"] as? String {
             guard
@@ -83,6 +89,7 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
                     as? [String: Any]
             else { return nil }
             jsonObject["arguments"] = argumentsObject
+            argumentsText = stringifiedArguments
         }
 
         guard
@@ -90,6 +97,10 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
             let function = try? JSONDecoder().decode(ToolCall.Function.self, from: normalizedData)
         else { return nil }
 
-        return ToolCall(function: function, id: id)
+        guard let argumentsText else { return ToolCall(function: function, id: id) }
+        return ToolCall(
+            function: ToolCall.Function(
+                name: function.name, arguments: function.arguments, writtenAs: argumentsText),
+            id: id)
     }
 }

@@ -119,6 +119,19 @@ struct ToolCallArgumentOrderTests {
                 == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
     }
 
+    @Test("Qwen 3.5 keeps the written order of a call it writes as JSON in its tool-call frame")
+    func qwenJSONKeepsTheWrittenOrder() throws {
+        let generated =
+            #"<tool_call>{"name": "record_edit", "arguments": {"target": "b.txt", "reason": "typo", "#
+            + #""action": "edit", "content": "B"}}</tool_call>"#
+        let call = try #require(
+            ToolCallFormat.qwen35.createParser().parse(content: generated, tools: nil))
+
+        #expect(
+            call.function.generatedArguments
+                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+    }
+
     @Test("A call restored from its generated arguments renders them in that order")
     func restoredCallRendersInGeneratedOrder() throws {
         let generatedArguments = #"{"b": "Lantern", "a": "Bring oil"}"#
