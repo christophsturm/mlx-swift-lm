@@ -151,6 +151,19 @@ struct ToolCallArgumentOrderTests {
                 == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
     }
 
+    @Test("A JSON tool call keeps the order its arguments were written in")
+    func jsonKeepsTheWrittenOrder() throws {
+        let generated =
+            #"<tool_call>{"name": "record_edit", "arguments": {"target": "b.txt", "reason": "typo", "#
+            + #""action": "edit", "content": "B"}}</tool_call>"#
+        let call = try #require(
+            ToolCallFormat.json.createParser().parse(content: generated, tools: nil))
+
+        #expect(
+            call.function.generatedArguments
+                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+    }
+
     @Test("A call restored from its generated arguments renders them in that order")
     func restoredCallRendersInGeneratedOrder() throws {
         let generatedArguments = #"{"b": "Lantern", "a": "Bring oil"}"#
