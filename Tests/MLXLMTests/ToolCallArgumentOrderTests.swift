@@ -74,6 +74,19 @@ struct ToolCallArgumentOrderTests {
         #expect(rendered.contains(generated))
     }
 
+    @Test("Gemma 4 keeps the order a call's arguments were written in")
+    func gemma4KeepsTheWrittenOrder() throws {
+        let generated =
+            #"<|tool_call>call:record_edit{target:<|"|>b.txt<|"|>,reason:<|"|>typo<|"|>,"#
+            + #"action:<|"|>edit<|"|>,content:<|"|>B<|"|>}<tool_call|>"#
+        let call = try #require(
+            ToolCallFormat.gemma4.createParser().parse(content: generated, tools: nil))
+
+        #expect(
+            call.function.generatedArguments
+                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+    }
+
     @Test("A call restored from its generated arguments renders them in that order")
     func restoredCallRendersInGeneratedOrder() throws {
         let generatedArguments = #"{"b": "Lantern", "a": "Bring oil"}"#
