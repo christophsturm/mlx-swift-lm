@@ -142,4 +142,34 @@ struct TurnScriptsTests {
         let cursors = Self.threeTurns.cursors(for: Self.ending(10) + [5] + Self.ending(99))
         #expect(cursors.last == .init(turn: 1, index: 0))
     }
+
+    // MARK: - Turns that continue after tool results
+
+    /// Like Gemma 4: a tool result renders inside the assistant's turn as text 20 or 22 closed by
+    /// 21, and the reply after the results follows without a turn marker.
+    static let eos = 3
+    static let resultEnd = 21
+    static let toolContinuation = TurnScripts(
+        scripts: [[5, eos], [6, eos], [7, eos]], turnMarker: [marker],
+        promptEndings: [ending(10), [22, resultEnd], ending(11)], endOfSequence: eos)
+
+    @Test func `a prompt ending without the turn marker starts its turn`() {
+        let cursors = Self.toolContinuation.cursors(
+            for: Self.ending(10) + [5, Self.eos] + [22, Self.resultEnd])
+        #expect(cursors.last == .init(turn: 1, index: 0))
+    }
+
+    @Test
+    func `a restored history starts each reply once though its results repeat a closing token`() {
+        // Reply 0 made two calls; both results close with 21, and only the second ends reply 1's
+        // prompt.
+        let history =
+            Self.ending(10) + [5, Self.eos] + [20, Self.resultEnd] + [22, Self.resultEnd]
+            + [6, Self.eos] + Self.ending(11)
+        let cursors = Self.toolContinuation.cursors(for: history)
+        #expect(cursors[6] == nil)
+        #expect(cursors[8] == .init(turn: 1, index: 0))
+        #expect(cursors[9] == .init(turn: 1, index: 1))
+        #expect(cursors.last == .init(turn: 2, index: 0))
+    }
 }

@@ -16,6 +16,11 @@ import Foundation
 /// When several turns match, the first one at or after the next turn wins, otherwise the
 /// last one.
 ///
+/// A prompt ending also starts its turn where no marker does. A template such as Gemma 4's
+/// renders tool results inside the assistant's turn and continues that turn without a
+/// generation prompt, so the reply after the results starts where its prompt ending ends.
+/// A turn found by its ending is counted once, however often its prompt repeats a token.
+///
 /// A turn past the last script emits ``endOfSequence`` (or a stop token), so an extra turn
 /// ends at once with an empty reply instead of running to `maxTokens`.
 ///
@@ -43,7 +48,8 @@ public struct TurnScripts: Sendable, Equatable {
     public let turnMarker: [Int]
 
     /// For each script, the tokens that end its prompt (the user message and the
-    /// generation prompt), or `nil` to place the turn by order alone.
+    /// generation prompt), or `nil` to place the turn by order alone. An ending that
+    /// does not end with ``turnMarker``, such as a tool result, starts its turn itself.
     public let promptEndings: [[Int]?]
 
     /// The end-of-sequence token. A turn whose script ends with it, or with a stop token, is
@@ -115,6 +121,14 @@ public struct TurnScripts: Sendable, Equatable {
                 continue
             }
 
+            if k == nil, let endingTurn = turnEnding(at: i, in: tokens, after: turn) {
+                turn = endingTurn
+                result[i] = Cursor(turn: turn, index: 0)
+                start = i + 1
+                i += 1
+                continue
+            }
+
             if let k {
                 result[i] = Cursor(turn: turn, index: k + 1)
             } else if start != nil {
@@ -128,6 +142,16 @@ public struct TurnScripts: Sendable, Equatable {
             i += 1
         }
         return result
+    }
+
+    /// The turn whose prompt ending ends at `index`, if one does, chosen as at a marker.
+    private func turnEnding(at index: Int, in tokens: [Int], after turn: Int) -> Int? {
+        let prompt = tokens[...index]
+        let matches = promptEndings.indices.filter { script in
+            guard let ending = promptEndings[script] else { return false }
+            return prompt.count >= ending.count && prompt.suffix(ending.count).elementsEqual(ending)
+        }
+        return matches.first { $0 > turn } ?? matches.last
     }
 
     private func nextTurn(after turn: Int, prompt: ArraySlice<Int>) -> Int {
