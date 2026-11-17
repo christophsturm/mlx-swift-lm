@@ -1293,6 +1293,7 @@ public struct Qwen2VLMessageGenerator: MessageGenerator {
         ]
         addReasoning(to: &dictionary, for: message)
         addToolMetadata(to: &dictionary, for: message)
+        addTurnEnd(to: &dictionary, for: message)
         return dictionary
     }
 }

@@ -2076,6 +2076,7 @@ public struct Qwen3VLMessageGenerator: MessageGenerator {
             dictionary["reasoning_content"] = reasoning
         }
         addToolMetadata(to: &dictionary, for: message)
+        addTurnEnd(to: &dictionary, for: message)
         return dictionary
     }
 }

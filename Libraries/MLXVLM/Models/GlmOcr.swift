@@ -1372,6 +1372,7 @@ public struct GlmOcrMessageGenerator: MessageGenerator {
             "content": contentParts(for: message, layout: .imagesThenText),
         ]
         addToolMetadata(to: &dictionary, for: message)
+        addTurnEnd(to: &dictionary, for: message)
         return dictionary
     }
 }

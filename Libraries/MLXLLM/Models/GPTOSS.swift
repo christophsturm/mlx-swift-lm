@@ -122,6 +122,7 @@ package struct GPTOSSMessageGenerator: MessageGenerator {
             "content": message.content,
         ]
         addToolMetadata(to: &dictionary, for: message)
+        addTurnEnd(to: &dictionary, for: message)
 
         // GPT-OSS template reads tool_calls[0] only. The Harmony router emits
         // at most one call per turn, so this is a defensive clamp for history

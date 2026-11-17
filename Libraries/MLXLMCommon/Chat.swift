@@ -27,6 +27,16 @@ public enum Chat {
         /// that replay it.
         public var reasoning: String? = nil
 
+        /// Whether this assistant message ends the assistant's turn, or `nil` to leave that to
+        /// the template. Message generators pass a value that is set to the chat template as
+        /// `end_turn`, and nothing when it is `nil`.
+        ///
+        /// It exists because some templates, such as Muse Glimmer's, end an answer with
+        /// end-of-message instead of end-of-turn when more assistant messages of the same turn
+        /// follow it, such as the calls a model wrote after its answer, and read that from
+        /// `end_turn`.
+        public var endsTurn: Bool? = nil
+
         /// Array of image data associated with the message.
         public var images: [UserInput.Image]
 
@@ -168,8 +178,17 @@ extension MessageGenerator {
 
         addReasoning(to: &dictionary, for: message)
         addToolMetadata(to: &dictionary, for: message)
+        addTurnEnd(to: &dictionary, for: message)
 
         return dictionary
+    }
+
+    /// Adds whether an assistant message ends its turn, as `end_turn`, when the message sets
+    /// it. A message that leaves it unset adds nothing, so templates see what they saw before.
+    package func addTurnEnd(to dictionary: inout Message, for message: Chat.Message) {
+        if let endsTurn = message.endsTurn {
+            dictionary["end_turn"] = endsTurn
+        }
     }
 
     /// Adds reasoning the session recorded apart from the content, as `reasoning_content`.
