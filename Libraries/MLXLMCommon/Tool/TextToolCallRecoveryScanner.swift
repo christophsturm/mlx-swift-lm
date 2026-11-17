@@ -1376,7 +1376,7 @@ struct TextToolCallRecoveryScanner: Sendable {
         else { return nil }
 
         return ToolCall(
-            function: .init(name: header, arguments: arguments),
+            function: .init(name: header, arguments: arguments, writtenAs: argumentsText),
             id: callID)
     }
 

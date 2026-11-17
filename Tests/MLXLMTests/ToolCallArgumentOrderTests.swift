@@ -100,6 +100,25 @@ struct ToolCallArgumentOrderTests {
                 == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
     }
 
+    @Test("A Mistral call recovered without its [ARGS] marker keeps its written order")
+    func mistralRecoveryKeepsTheWrittenOrder() throws {
+        let tools: [[String: any Sendable]] = [
+            ["function": ["name": "record_edit"] as [String: any Sendable]]
+        ]
+        let processor = ToolCallProcessor(format: .mistral, tools: tools)
+        let generated =
+            #"[TOOL_CALLS]record_edit{"target": "b.txt", "reason": "typo", "#
+            + #""action": "edit", "content": "B"}"#
+
+        #expect(processor.processChunk(generated) == nil)
+        processor.processEOS()
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(
+            call.function.generatedArguments
+                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+    }
+
     @Test("A call restored from its generated arguments renders them in that order")
     func restoredCallRendersInGeneratedOrder() throws {
         let generatedArguments = #"{"b": "Lantern", "a": "Bring oil"}"#
