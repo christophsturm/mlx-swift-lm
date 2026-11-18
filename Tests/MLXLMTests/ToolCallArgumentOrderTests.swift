@@ -180,6 +180,96 @@ struct ToolCallArgumentOrderTests {
                 "<parameter=b>\nLantern\n</parameter>\n<parameter=a>\nBring oil\n</parameter>"))
     }
 
+    /// The app's edit call as Qwen 3.5's parser keeps it when the model writes the edits in the
+    /// reference form: the schema's key order and `", "` and `": "` separators.
+    static let editArguments =
+        #"{"path":"notes.txt","edits":[{"oldText": "alpha", "newText": "beta"}, "#
+        + #"{"oldText": "gamma", "newText": "delta"}]}"#
+
+    @Test("A message carries each call's written value texts beside its argument order")
+    func messageCarriesWrittenValueTexts() throws {
+        let function = try ToolCall.Function(name: "edit", generatedArguments: Self.editArguments)
+        let message = DefaultMessageGenerator().generate(
+            message: .assistant("", toolCalls: [ToolCall(function: function, id: "call-edit")]))
+        let expected: Message = [
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                [
+                    "type": "function",
+                    "id": "call-edit",
+                    "function": [
+                        "name": "edit",
+                        "arguments": [
+                            "path": "notes.txt",
+                            "edits": [
+                                ["oldText": "alpha", "newText": "beta"],
+                                ["oldText": "gamma", "newText": "delta"],
+                            ],
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ],
+            ToolCall.argumentOrderKey: [["path", "edits"]],
+            ToolCall.argumentTextsKey: [
+                [
+                    #""notes.txt""#,
+                    #"[{"oldText": "alpha", "newText": "beta"}, "#
+                        + #"{"oldText": "gamma", "newText": "delta"}]"#,
+                ]
+            ],
+        ]
+
+        #expect(try Value(any: message) == Value(any: expected))
+    }
+
+    @Test("A message carries neither argument key for a call without written arguments")
+    func messageWithoutWrittenArgumentsCarriesNoArgumentKeys() throws {
+        let function = ToolCall.Function(name: "edit", arguments: ["path": .string("notes.txt")])
+        let message = DefaultMessageGenerator().generate(
+            message: .assistant("", toolCalls: [ToolCall(function: function, id: "call-edit")]))
+        let expected: Message = [
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                [
+                    "type": "function",
+                    "id": "call-edit",
+                    "function": [
+                        "name": "edit",
+                        "arguments": ["path": "notes.txt"] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ],
+        ]
+
+        #expect(try Value(any: message) == Value(any: expected))
+    }
+
+    @Test("Qwen 3.5's and Muse Glimmer's templates render the same with or without the value texts")
+    func writtenValueTextsLeaveRenderingUnchanged() throws {
+        let function = try ToolCall.Function(
+            name: "note", generatedArguments: #"{"b": "Lantern", "a": "Bring oil"}"#)
+        let generators: [(template: String, generator: any MessageGenerator)] = [
+            ("qwen3.5-0.8B", DefaultMessageGenerator()),
+            ("muse-glimmer-30B", Qwen2VLMessageGenerator()),
+        ]
+        for (template, generator) in generators {
+            let messages = generator.generate(
+                messages: conversation(calling: ToolCall(function: function, id: "call-note")))
+            let withoutTexts = messages.map { message in
+                var message = message
+                message[ToolCall.argumentTextsKey] = nil
+                return message
+            }
+
+            #expect(messages.last?[ToolCall.argumentTextsKey] != nil, "\(template)")
+            #expect(
+                try render(template, messages: messages)
+                    == render(template, messages: withoutTexts), "\(template)")
+        }
+    }
+
     private func conversation(calling call: ToolCall) -> [Chat.Message] {
         [.user("Write a note."), .assistant("", toolCalls: [call])]
     }

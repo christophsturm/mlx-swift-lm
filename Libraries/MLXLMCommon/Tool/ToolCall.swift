@@ -178,6 +178,16 @@ public struct ToolCall: Hashable, Codable, Sendable {
     /// whole call objects do not render it.
     public static let argumentOrderKey = "tool_call_argument_order"
 
+    /// The key under which a rendered message lists, for each of its `tool_calls`, the JSON text
+    /// of each argument value as the model wrote it, in the order ``argumentOrderKey`` names them.
+    ///
+    /// It is for a renderer that wants a call exactly as the model wrote it, which re-encoding
+    /// `arguments` cannot reproduce: the texts are ``Function/writtenArguments``. A call without
+    /// written arguments has `nil` in its place. Messages carry the key whenever they carry
+    /// ``argumentOrderKey``, beside `tool_calls`, so templates that iterate or serialize a call
+    /// do not render it.
+    public static let argumentTextsKey = "tool_call_argument_texts"
+
     public init(function: Function, id: String? = nil) {
         self.function = function
         self.id = id
