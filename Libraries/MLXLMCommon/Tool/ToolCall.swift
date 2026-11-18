@@ -114,10 +114,21 @@ public struct ToolCall: Hashable, Codable, Sendable {
             arguments.mapValues { $0.sendableValue }
         }
 
+        /// The arguments in the order the model wrote them, each with its value's JSON text from
+        /// ``generatedArguments``: the model's own text where it wrote the value as the JSON it
+        /// decodes from, the encoded value otherwise, as for a string parameter written raw.
+        ///
+        /// A renderer that must reproduce the generated tokens reads arguments here rather than
+        /// re-encoding ``arguments``. `nil` when the written order is unknown.
+        public var writtenArguments: [(name: String, value: String)]? {
+            generatedArguments.flatMap { jsonObjectMembers($0[...]) }?
+                .map { (name: $0.key, value: String($0.value)) }
+        }
+
         /// The argument names in generated order when known, otherwise sorted, which is the
         /// order a template engine gives an unordered dictionary.
         var argumentNames: [String] {
-            generatedArguments.flatMap(jsonObjectKeys) ?? arguments.keys.sorted()
+            writtenArguments?.map(\.name) ?? arguments.keys.sorted()
         }
 
         public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -194,12 +205,6 @@ private func jsonText(_ text: Substring, decodingTo value: JSONValue) -> Substri
         JSONValue.from(asSendable(decoded)) == value
     else { return nil }
     return trimmed
-}
-
-/// The keys of one JSON object in the order its text lists them, or `nil` when `text` is not
-/// one JSON object.
-private func jsonObjectKeys(_ text: String) -> [String]? {
-    jsonObjectMembers(text[...])?.map(\.key)
 }
 
 /// The members of one JSON object in the order its text lists them, each value as the text it is

@@ -110,6 +110,27 @@ struct ToolCallWrittenArgumentsTests {
         #expect(call.function.generatedArguments == #"{"ratio":1.0,"limit":1e3}"#)
     }
 
+    @Test("A call lists its arguments in written order, each with its value's written JSON text")
+    func writtenArgumentsListNamesAndValueTexts() throws {
+        let generated =
+            "<tool_call>\n<function=edit>\n<parameter=path>\nnotes.txt\n</parameter>\n"
+            + "<parameter=edits>\n\(Self.referenceEdits)\n</parameter>\n</function>\n</tool_call>"
+        let parsed = try #require(
+            ToolCallFormat.qwen35.createParser().parse(content: generated, tools: Self.tools))
+        let restored = try ToolCall.Function(
+            name: "edit",
+            generatedArguments: #"{"path": "notes.txt", "edits": "# + Self.referenceEdits + "}")
+        let unordered = ToolCall.Function(name: "edit", arguments: ["path": .string("notes.txt")])
+
+        let parsedArguments = try #require(parsed.function.writtenArguments)
+        let restoredArguments = try #require(restored.writtenArguments)
+        #expect(parsedArguments.map(\.name) == ["path", "edits"])
+        #expect(parsedArguments.map(\.value) == [#""notes.txt""#, Self.referenceEdits])
+        #expect(restoredArguments.map(\.name) == ["path", "edits"])
+        #expect(restoredArguments.map(\.value) == [#""notes.txt""#, Self.referenceEdits])
+        #expect(unordered.writtenArguments == nil)
+    }
+
     @Test("A JSON call keeps its whole arguments object as the model wrote it")
     func jsonKeepsTheWrittenObject() throws {
         let arguments =
