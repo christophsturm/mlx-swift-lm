@@ -153,6 +153,24 @@ struct ToolCallWrittenArgumentsTests {
         #expect(call.function.generatedArguments == arguments)
     }
 
+    @Test(
+        "A value the schema converts is encoded, while the other values keep their written text and order"
+    )
+    func schemaConversionKeepsTheOtherWrittenValues() throws {
+        let processor = ToolCallProcessor(format: .json, tools: Self.tools)
+        let generated =
+            #"<tool_call>{"name": "tune", "arguments": {"options": {"zeta": 1, "alpha": 2}, "#
+            + #""limit": "7"}}</tool_call>"#
+
+        _ = processor.processChunk(generated)
+        processor.processEOS()
+
+        let call = try #require(processor.toolCalls.first)
+        #expect(call.function.arguments["limit"] == .int(7))
+        #expect(
+            call.function.generatedArguments == #"{"options":{"zeta": 1, "alpha": 2},"limit":7}"#)
+    }
+
     @Test("Two JSON calls in one reply each keep their arguments object as the model wrote it")
     func twoJSONCallsKeepTheirWrittenObjects() throws {
         let processor = ToolCallProcessor(format: .json, tools: Self.tools)

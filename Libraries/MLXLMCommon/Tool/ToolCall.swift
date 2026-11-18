@@ -125,6 +125,26 @@ public struct ToolCall: Hashable, Codable, Sendable {
                 .map { (name: $0.key, value: String($0.value)) }
         }
 
+        /// The call with `arguments` in place of its own, as schema normalization converts them.
+        ///
+        /// The written order stays; a value `arguments` leaves as written keeps its written text,
+        /// and a converted value is encoded. Without a written order, the order stays unknown.
+        package func replacingArguments(_ arguments: [String: JSONValue]) -> Function {
+            guard let written = writtenArguments,
+                Set(written.map(\.name)) == Set(arguments.keys)
+            else { return Function(name: name, arguments: arguments) }
+            return Function(
+                name: name, arguments: arguments,
+                generatedArguments: writtenObjectText(
+                    written.map { ($0.name, arguments[$0.name]!, $0.value[...]) }))
+        }
+
+        private init(name: String, arguments: [String: JSONValue], generatedArguments: String?) {
+            self.name = name
+            self.arguments = arguments
+            self.generatedArguments = generatedArguments
+        }
+
         /// The argument names in generated order when known, otherwise sorted, which is the
         /// order a template engine gives an unordered dictionary.
         var argumentNames: [String] {

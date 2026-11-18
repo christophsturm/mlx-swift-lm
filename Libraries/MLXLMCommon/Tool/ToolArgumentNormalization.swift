@@ -22,8 +22,7 @@ enum ToolArgumentNormalization {
             }
         }
         guard changed else { return call }
-        return ToolCall(
-            function: .init(name: call.function.name, arguments: arguments), id: call.id)
+        return ToolCall(function: call.function.replacingArguments(arguments), id: call.id)
     }
 
     static func normalize(
