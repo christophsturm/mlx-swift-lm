@@ -70,29 +70,44 @@ public struct ToolCall: Hashable, Codable, Sendable {
         }
 
         /// A call whose arguments the model wrote as the JSON object `text`, which `arguments`
-        /// was decoded from, listing them in the order `text` does. When `text` is not one JSON
-        /// object naming exactly the arguments, the order stays unknown.
+        /// was decoded from into Swift values; ``generatedArguments`` follows the same rules as
+        /// for arguments decoded into `JSONValue`s.
         package init(name: String, arguments: [String: any Sendable], writtenAs text: String) {
             self.init(
                 name: name, arguments: arguments.mapValues { JSONValue.from($0) }, writtenAs: text)
         }
 
         /// A call whose arguments the model wrote as the JSON object `text`, which `arguments`
-        /// was decoded from, listing them in the order `text` does. When `text` is not one JSON
-        /// object naming exactly the arguments, the order stays unknown. A repeated name keeps
-        /// its first position.
+        /// was decoded from.
+        ///
+        /// ``generatedArguments`` is `text` as written when it names each argument once and
+        /// decodes to exactly `arguments`. Otherwise it lists the arguments in the order `text`
+        /// does, each value as written where that text decodes to it, a repeated name in its
+        /// first position. When `text` is not one JSON object naming exactly the arguments, the
+        /// order stays unknown.
         package init(name: String, arguments: [String: JSONValue], writtenAs text: String) {
             self.name = name
             self.arguments = arguments
-            let keys = jsonObjectKeys(text)
+            let members = jsonObjectMembers(text[...])
             var names = [String]()
-            var seen = Set<String>()
-            for key in keys ?? [] where seen.insert(key).inserted {
-                names.append(key)
+            var written = [String: Substring]()
+            for member in members ?? [] {
+                if written.updateValue(member.value, forKey: member.key) == nil {
+                    names.append(member.key)
+                }
             }
-            self.generatedArguments =
-                keys != nil && seen == Set(arguments.keys)
-                ? writtenObjectText(names.map { ($0, arguments[$0]!, nil) }) : nil
+            guard let members, Set(names) == Set(arguments.keys) else {
+                self.generatedArguments = nil
+                return
+            }
+            if names.count == members.count,
+                let object = jsonText(text[...], decodingTo: .object(arguments))
+            {
+                self.generatedArguments = String(object)
+            } else {
+                self.generatedArguments = writtenObjectText(
+                    names.map { ($0, arguments[$0]!, written[$0]) })
+            }
         }
 
         var argumentsObject: [String: any Sendable] {

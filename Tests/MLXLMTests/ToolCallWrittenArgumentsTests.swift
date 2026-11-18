@@ -110,6 +110,43 @@ struct ToolCallWrittenArgumentsTests {
         #expect(call.function.generatedArguments == #"{"ratio":1.0,"limit":1e3}"#)
     }
 
+    @Test("A JSON call keeps its whole arguments object as the model wrote it")
+    func jsonKeepsTheWrittenObject() throws {
+        let arguments =
+            #"{"label": "say \"hi\", then go", "ratio": 1.0, "limit": 1e3, "#
+            + #""options": {"zeta": 1, "alpha": {"yankee": true, "bravo": null}}}"#
+        let generated = #"<tool_call>{"name": "tune", "arguments": "# + arguments + "}</tool_call>"
+        let call = try #require(
+            ToolCallFormat.json.createParser().parse(content: generated, tools: Self.tools))
+
+        #expect(call.function.generatedArguments == arguments)
+    }
+
+    @Test("Mistral keeps an edit call's arguments object as the model wrote it")
+    func mistralKeepsTheWrittenObject() throws {
+        let arguments = #"{"path": "notes.txt", "edits": "# + Self.referenceEdits + "}"
+        let generated = "[TOOL_CALLS]edit[ARGS]" + arguments
+        let call = try #require(
+            ToolCallFormat.mistral.createParser().parse(content: generated, tools: Self.tools))
+
+        #expect(call.function.generatedArguments == arguments)
+    }
+
+    @Test("Two JSON calls in one reply each keep their arguments object as the model wrote it")
+    func twoJSONCallsKeepTheirWrittenObjects() throws {
+        let processor = ToolCallProcessor(format: .json, tools: Self.tools)
+        let edit = #"{"path": "notes.txt", "edits": "# + Self.referenceEdits + "}"
+        let tune = #"{"options": {"zeta": 2, "alpha": [3, 1]}, "ratio": 2.50}"#
+        let generated =
+            #"<tool_call>{"name": "edit", "arguments": "# + edit + "}</tool_call>\n"
+            + #"<tool_call>{"name": "tune", "arguments": "# + tune + "}</tool_call>"
+
+        _ = processor.processChunk(generated)
+        processor.processEOS()
+
+        #expect(processor.toolCalls.map(\.function.generatedArguments) == [edit, tune])
+    }
+
     @Test("Two Qwen 3.5 calls in one reply each keep their values as the model wrote them")
     func twoQwenCallsKeepTheirWrittenValues() throws {
         let processor = ToolCallProcessor(format: .qwen35, tools: Self.tools)

@@ -97,7 +97,7 @@ struct ToolCallArgumentOrderTests {
 
         #expect(
             call.function.generatedArguments
-                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+                == #"{"target": "b.txt", "reason": "typo", "action": "edit", "content": "B"}"#)
     }
 
     @Test("A Mistral call recovered without its [ARGS] marker keeps its written order")
@@ -116,7 +116,7 @@ struct ToolCallArgumentOrderTests {
         let call = try #require(processor.toolCalls.first)
         #expect(
             call.function.generatedArguments
-                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+                == #"{"target": "b.txt", "reason": "typo", "action": "edit", "content": "B"}"#)
     }
 
     @Test("Qwen 3.5 keeps the written order of a call it writes as JSON in its tool-call frame")
@@ -129,7 +129,7 @@ struct ToolCallArgumentOrderTests {
 
         #expect(
             call.function.generatedArguments
-                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+                == #"{"target": "b.txt", "reason": "typo", "action": "edit", "content": "B"}"#)
     }
 
     @Test("A JSON call in a tool-call frame that recovery heals keeps its written order")
@@ -148,7 +148,7 @@ struct ToolCallArgumentOrderTests {
         let call = try #require(processor.toolCalls.first)
         #expect(
             call.function.generatedArguments
-                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+                == #"{"target": "b.txt", "reason": "typo", "action": "edit", "content": "B"}"#)
     }
 
     @Test("A JSON tool call keeps the order its arguments were written in")
@@ -161,7 +161,7 @@ struct ToolCallArgumentOrderTests {
 
         #expect(
             call.function.generatedArguments
-                == #"{"target":"b.txt","reason":"typo","action":"edit","content":"B"}"#)
+                == #"{"target": "b.txt", "reason": "typo", "action": "edit", "content": "B"}"#)
     }
 
     @Test("A call restored from its generated arguments renders them in that order")
