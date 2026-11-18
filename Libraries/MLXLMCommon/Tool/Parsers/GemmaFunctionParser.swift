@@ -48,7 +48,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         guard !funcName.isEmpty else { return nil }
 
         let body = remaining[remaining.index(after: braceStart) ..< braceEnd]
-        var arguments: [(name: String, value: any Sendable)] = []
+        var arguments: [(name: String, value: any Sendable, written: Substring)] = []
 
         // Each field is `key:value`. Splitting at top level keeps a comma that
         // belongs to an escaped string or a nested object out of the split, so a
@@ -62,7 +62,8 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             arguments.append(
                 (
                     key,
-                    value(of: rawValue, key: key, funcName: funcName, marker: marker, tools: tools)
+                    value(of: rawValue, key: key, funcName: funcName, marker: marker, tools: tools),
+                    rawValue
                 ))
         }
 

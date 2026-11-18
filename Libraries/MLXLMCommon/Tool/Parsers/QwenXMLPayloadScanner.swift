@@ -217,7 +217,8 @@ extension QwenXMLPayloadScanner.Payload {
     /// paths as well as cross-dialect recovery — funnels through this method, so
     /// argument extraction cannot drift between them.
     func toolCall(tools: [[String: any Sendable]]?) -> ToolCall {
-        let arguments = parameters.map { parameter -> (name: String, value: any Sendable) in
+        let arguments = parameters.map {
+            parameter -> (name: String, value: any Sendable, written: Substring) in
             var value = String(parameter.value)
             // Trim a single leading/trailing newline (matching the Qwen3 Coder
             // reference implementation, which formats values on their own line).
@@ -226,7 +227,8 @@ extension QwenXMLPayloadScanner.Payload {
             return (
                 parameter.name,
                 convertParameterValue(
-                    value, paramName: parameter.name, funcName: name, tools: tools)
+                    value, paramName: parameter.name, funcName: name, tools: tools),
+                value[...]
             )
         }
         return ToolCall(function: .init(name: name, orderedArguments: arguments))

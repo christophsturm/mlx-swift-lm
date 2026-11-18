@@ -44,19 +44,29 @@ public struct ToolCall: Hashable, Codable, Sendable {
         }
 
         /// A call parsed from model output, its arguments in the order the model generated them.
-        /// A repeated name keeps its first position and, as in ``arguments``, its last value.
-        package init(name: String, orderedArguments: [(name: String, value: any Sendable)]) {
+        ///
+        /// `written` is the text the parser read each value from. A value keeps that text in
+        /// ``generatedArguments`` when it is the JSON the value decodes from, and is encoded
+        /// otherwise, as a string parameter written raw is. A repeated name keeps its first
+        /// position and, as in ``arguments``, its last value and text.
+        package init(
+            name: String,
+            orderedArguments: [(name: String, value: any Sendable, written: Substring)]
+        ) {
             var arguments = [String: JSONValue]()
+            var written = [String: Substring]()
             var names = [String]()
             for argument in orderedArguments {
                 let value = JSONValue.from(argument.value)
                 if arguments.updateValue(value, forKey: argument.name) == nil {
                     names.append(argument.name)
                 }
+                written[argument.name] = argument.written
             }
             self.name = name
             self.arguments = arguments
-            self.generatedArguments = jsonObjectText(names.map { ($0, arguments[$0]!) })
+            self.generatedArguments = writtenObjectText(
+                names.map { ($0, arguments[$0]!, written[$0]) })
         }
 
         /// A call whose arguments the model wrote as the JSON object `text`, which `arguments`
@@ -82,7 +92,7 @@ public struct ToolCall: Hashable, Codable, Sendable {
             }
             self.generatedArguments =
                 keys != nil && seen == Set(arguments.keys)
-                ? jsonObjectText(names.map { ($0, arguments[$0]!) }) : nil
+                ? writtenObjectText(names.map { ($0, arguments[$0]!, nil) }) : nil
         }
 
         var argumentsObject: [String: any Sendable] {
@@ -129,18 +139,46 @@ public struct ToolCall: Hashable, Codable, Sendable {
 }
 
 /// One JSON object listing `members` in order, or `nil` when a value has no JSON text.
-private func jsonObjectText(_ members: [(name: String, value: JSONValue)]) -> String? {
+///
+/// Each value is the text it was written as when that text is the JSON it decodes from, and is
+/// encoded otherwise.
+private func writtenObjectText(
+    _ members: [(name: String, value: JSONValue, written: Substring?)]
+) -> String? {
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
     var parts = [String]()
     for member in members {
-        guard let name = try? encoder.encode(member.name),
-            let value = try? encoder.encode(member.value)
-        else { return nil }
-        parts.append(
-            String(decoding: name, as: UTF8.self) + ":" + String(decoding: value, as: UTF8.self))
+        guard let name = try? encoder.encode(member.name) else { return nil }
+        let value: String
+        if let written = member.written.flatMap({ jsonText($0, decodingTo: member.value) }) {
+            value = String(written)
+        } else {
+            guard let encoded = try? encoder.encode(member.value) else { return nil }
+            value = String(decoding: encoded, as: UTF8.self)
+        }
+        parts.append(String(decoding: name, as: UTF8.self) + ":" + value)
     }
     return "{" + parts.joined(separator: ",") + "}"
+}
+
+/// `text` without surrounding whitespace when that is exactly one JSON value which decodes to
+/// `value`, read as the parsers read JSON.
+private func jsonText(_ text: Substring, decodingTo value: JSONValue) -> Substring? {
+    let whitespace: Set<Character> = [" ", "\t", "\n", "\r"]
+    guard let first = text.firstIndex(where: { !whitespace.contains($0) }),
+        let last = text.lastIndex(where: { !whitespace.contains($0) })
+    else { return nil }
+    let trimmed = text[first ... last]
+    // A trailing space ends a number, which the scanner cannot tell is complete otherwise.
+    var scanner = JSONPrefixScanner()
+    guard case .complete(let length) = scanner.scan(trimmed + " "),
+        length == trimmed.utf8.count,
+        let decoded = try? JSONSerialization.jsonObject(
+            with: Data(trimmed.utf8), options: .fragmentsAllowed),
+        JSONValue.from(asSendable(decoded)) == value
+    else { return nil }
+    return trimmed
 }
 
 /// The keys of one JSON object in the order its text lists them, or `nil` when `text` is not
