@@ -270,6 +270,35 @@ struct ToolCallArgumentOrderTests {
         }
     }
 
+    /// The Python reference writes a top-level null through Qwen 3.5's `args_value | string` as
+    /// `None` and through Muse Glimmer's `v is none` branch as `null`, and nested nulls through
+    /// `tojson` (`json.dumps`) as `{"x": [1, null], "y": null}`. swift-jinja 2.3.5 writes
+    /// `.null | string` as the empty string and `tojson` with sorted keys and no spaces, so the
+    /// expectations below are what this render path produces.
+    @Test(
+        "A call with null arguments, also inside arrays and objects, renders in Qwen 3.5 and Muse")
+    func nullArgumentsRender() throws {
+        let function = try ToolCall.Function(
+            name: "note", generatedArguments: #"{"b": null, "a": {"x": [1, null], "y": null}}"#)
+        let call = ToolCall(function: function, id: "call-note")
+
+        let qwen = try render(
+            "qwen3.5-0.8B",
+            messages: DefaultMessageGenerator().generate(messages: conversation(calling: call)))
+        let muse = try render(
+            "muse-glimmer-30B",
+            messages: Qwen2VLMessageGenerator().generate(messages: conversation(calling: call)))
+
+        #expect(
+            qwen.contains(
+                "<parameter=b>\n\n</parameter>\n<parameter=a>\n"
+                    + #"{"x":[1,null],"y":null}"# + "\n</parameter>"))
+        #expect(
+            muse.contains(
+                #"<atem:parameter name="b">null</atem:parameter>"# + "\n"
+                    + #"<atem:parameter name="a">{"x":[1,null],"y":null}</atem:parameter>"#))
+    }
+
     private func conversation(calling call: ToolCall) -> [Chat.Message] {
         [.user("Write a note."), .assistant("", toolCalls: [call])]
     }
@@ -302,15 +331,17 @@ private func templateValue(_ message: Message) throws -> Value {
     return .object(object)
 }
 
+/// Reorders a converted call's arguments. The members are read from the converted object, not
+/// from the raw dictionary: `Value(any:)` reads a null argument as null only when it converts the
+/// dictionary that holds it.
 private func orderedCallValue(_ call: [String: any Sendable], order: [String]) throws -> Value {
     guard case .object(var object) = try Value(any: call),
-        let function = call["function"] as? [String: any Sendable],
-        let arguments = function["arguments"] as? [String: any Sendable],
-        case .object(var functionObject) = try Value(any: function)
+        case .object(var functionObject)? = object["function"],
+        case .object(let arguments)? = functionObject["arguments"]
     else { throw TemplateValueError.notAnObject }
     var ordered = OrderedDictionary<String, Value>()
     for name in order {
-        ordered[name] = try Value(any: arguments[name])
+        ordered[name] = arguments[name]
     }
     functionObject["arguments"] = .object(ordered)
     object["function"] = .object(functionObject)

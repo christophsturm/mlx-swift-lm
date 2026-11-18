@@ -138,6 +138,24 @@ public enum JSONValue: Hashable, Codable, Sendable {
         }
     }
 
+    /// The value as a chat message hands it to a template engine.
+    ///
+    /// Null is Swift's `nil`, which template bridges such as swift-jinja's `Value(any:)` read as
+    /// their none value when they convert the dictionary or array holding it. ``sendableValue``'s
+    /// `NSNull` suits JSON serialization but has no template value.
+    var messageValue: any Sendable {
+        switch self {
+        case .null:
+            return Optional<any Sendable>.none
+        case .array(let value):
+            return value.map { $0.messageValue }
+        case .object(let value):
+            return value.mapValues { $0.messageValue }
+        case .bool, .int, .double, .string:
+            return sendableValue
+        }
+    }
+
     /// Convert to JSON Schema representation
     public var asSchema: [String: any Sendable] {
         switch self {

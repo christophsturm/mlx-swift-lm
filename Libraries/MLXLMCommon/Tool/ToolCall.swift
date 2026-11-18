@@ -110,8 +110,9 @@ public struct ToolCall: Hashable, Codable, Sendable {
             }
         }
 
+        /// The arguments as a chat message hands them to a template engine.
         var argumentsObject: [String: any Sendable] {
-            arguments.mapValues { $0.sendableValue }
+            arguments.mapValues { $0.messageValue }
         }
 
         /// The arguments in the order the model wrote them, each with its value's JSON text from
